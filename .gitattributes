@@ -1,0 +1,7 @@
+# The repository stores text as LF and checks it out as LF everywhere, so a
+# Windows contributor's core.autocrlf cannot turn a one-line change into a
+# whole-file diff for everyone else.
+* text=auto eol=lf
+
+# Generated: keep it out of diffs and reviews, but still versioned.
+package-lock.json linguist-generated=true -diff
