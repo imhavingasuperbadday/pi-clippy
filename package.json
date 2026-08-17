@@ -1,0 +1,40 @@
+{
+  "name": "pi-clippy",
+  "version": "0.1.0",
+  "description": "Clippy activity avatar for pi: the earnest Microsoft Office Assistant watches your coding session and offers completely misplaced help",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "clippy",
+    "office-assistant"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "npm run typecheck && npm run test:unit",
+    "test:unit": "tsx test/actions.test.ts && tsx test/temper.test.ts && tsx test/viewer.test.ts && tsx test/runtime.test.ts && tsx test/buddy.test.ts && tsx test/floor.test.ts && tsx test/crosstalk.test.ts && tsx test/nag.test.ts && tsx test/mood.test.ts && tsx test/seasons.test.ts && tsx test/stats.test.ts",
+    "probe": "tsx scripts/repro-drift.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.23.12",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "clippyjs": "^0.1.0",
+    "electron": "^43.4.0"
+  }
+}
