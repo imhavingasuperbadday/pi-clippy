@@ -2,6 +2,7 @@
  * extraction, topic keys, snooze detection, and the three nag lines. All
  * pure functions — no timers, no runtime. */
 import {
+  dismissedOfferLine,
   ignoredOfferLine,
   isSnoozeLabel,
   nagChoices,
@@ -61,6 +62,12 @@ function main(): void {
   check('ignoredOfferLine takes silence as yes', ignoredOfferLine('grading letters').includes('taken that as a yes'))
   check('ignoredOfferLine empty fallback', ignoredOfferLine('').includes('my earlier offer'))
   check('snoozeLine files under Do Not Reopen', snoozeLine('grading letters').includes('Do Not Reopen'))
+
+  // Dismissed-offer line: the third, annoyed way an unanswered offer ends
+  // (distinct from "taken as a yes" and from a silent drop with no balloon)
+  check('dismissedOfferLine decides against it himself', dismissedOfferLine('grading letters').includes('decide that one myself'))
+  check('dismissedOfferLine empty fallback', dismissedOfferLine('').includes('my earlier offer'))
+  check('dismissedOfferLine is distinct from ignoredOfferLine', dismissedOfferLine('grading letters') !== ignoredOfferLine('grading letters'))
 
   // Nag buttons: snooze appears after the second refusal, never duplicated
   check('nagChoices level 1 no snooze', nagChoices(['Yes', 'No'], 1).length === 2)

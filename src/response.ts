@@ -50,6 +50,22 @@ export interface ClippyBalloon {
   readonly summon?: string
 }
 
+/** What a quiet background thought decided to do (see generateIdleThought
+ * in src/generator.ts): Clippy, idle and unobserved, either starts a chat
+ * with one of the rival assistants, offers help, says one small thing, or
+ * keeps his peace. The runtime validates the agent against the configured
+ * roster before any window opens — a thought never summons on its own. */
+export type IdleThoughtAction = 'chat' | 'offer' | 'remark' | 'nothing'
+
+export interface IdleThought {
+  readonly action: IdleThoughtAction
+  /** For chat: the rival Clippy decided to call over. */
+  readonly agent?: string
+  /** What he decided to say out loud (a lowercase phrase that follows
+   * "It looks like"); empty for nothing. */
+  readonly statement: string
+}
+
 export const OFFICE_TASKS = Object.freeze(Object.keys(OFFICE_OFFERS) as OfficeTask[])
 const MAX_STATEMENT_CHARS = 140
 
@@ -93,6 +109,45 @@ function unwrapJson(raw: string): string {
   const trimmed = raw.trim()
   const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/iu)
   return fenced?.[1] ?? trimmed
+}
+
+/** Parse a background-thought decision. The action is the whole point, so
+ * a malformed thought fails rather than being guessed at: the generator
+ * degrades the failure to `nothing`, and Clippy keeps waiting. */
+export function parseIdleThought(raw: string): IdleThought {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(unwrapJson(raw))
+  } catch (error: unknown) {
+    throw new Error('Clippy idle thought is not valid JSON', { cause: error })
+  }
+  if (!plainRecord(parsed)) throw new Error('Clippy idle thought must be a JSON object')
+  const action = parsed.action
+  if (action !== 'chat' && action !== 'offer' && action !== 'remark' && action !== 'nothing') {
+    throw new Error('Clippy idle thought action must be chat, offer, remark, or nothing')
+  }
+  const isChat = action === 'chat'
+  const agent = normalizeSummon(parsed.agent)
+  if (isChat && agent === undefined) {
+    throw new Error('Clippy chat thought must name a rival assistant')
+  }
+  const rawStatement = typeof parsed.statement === 'string'
+    ? parsed.statement.replace(/\s+/gu, ' ').trim()
+    : ''
+  let statement = action === 'nothing' ? '' : rawStatement
+  if (statement !== '') {
+    const asksQuestion = /\?\s*$/u.test(statement) || /would you like (?:help|me to)/iu.test(statement)
+    statement = statement.replace(/[.!]+$/u, '')
+    if (asksQuestion) statement += '?'
+    if (statement.length === 0 || statement.length > MAX_STATEMENT_CHARS) {
+      throw new Error(`Clippy idle thought statement must contain 1-${MAX_STATEMENT_CHARS} characters`)
+    }
+  }
+  return {
+    action: action as IdleThoughtAction,
+    ...(isChat && agent !== undefined ? { agent } : {}),
+    statement,
+  }
 }
 
 /** Parse one short model draft while tolerating harmless legacy fields. */

@@ -26,7 +26,6 @@ import { choiceSetFor, BuddyCoordinator, DEFAULT_BUDDY_TIMINGS, type BuddyTiming
 import { defaultClippyConfig, type ClippyConfig } from './config.ts'
 import { ANIMATIONS, balloonLines, type ClippyState } from './frames.ts'
 import {
-  acceptanceMessage,
   agentNamedIn,
   effectForLabel,
   type ChoiceEffect,
@@ -34,9 +33,11 @@ import {
 import { angryStatement, swearStrength, swearingAllowed } from './temper.ts'
 import {
   generateChatterLine,
-  generateChoiceReplyLine,
+  generateClippyReply,
   generateClippyResponse,
   generateExplainResponse,
+  generateIdleThought,
+  generateOfferAction,
   generateRoastResponse,
   generateSuggestResponse,
   type ClippyModelRouteOverride,
@@ -49,18 +50,25 @@ import {
   chooseRandomOfficeTask,
   renderClippyResponse,
   renderClippyResponseWithOffer,
+  renderClippyResponseWithPersonality,
   type ClippyBalloon,
+  type IdleThought,
   type OfficeTask,
 } from './response.ts'
 import { detectOccasion, seasonalOffer, seasonalStatement } from './seasons.ts'
 import {
   alreadyGreetedToday,
   bumpBalloons,
+  graceSavedStatement,
   greetingStatement,
   loadStats,
   markGreeted,
+  milestoneStatement,
+  mourningStatement,
   recordTestResultsFromEntries,
+  statsStatement,
   touchSession,
+  type StreakEvent,
 } from './stats.ts'
 import type { ClippyViewer } from './viewer.ts'
 
@@ -98,15 +106,6 @@ const CLIMATE_REFRESH_MS = 15_000
 const SEASONAL_OFFER_CHANCE_HOLIDAY = 0.75
 const SEASONAL_OFFER_CHANCE_ORDINARY = 0.3
 
-const CHOICE_REACTIONS = [
-  'Excellent. I will begin right away.',
-  'A wonderful choice. I have already started.',
-  'I knew you would say yes.',
-  'Splendid. I will add it to my list of helpful things.',
-  'You will not regret this. I certainly will not.',
-  'I am putting on my helpful face.',
-] as const
-
 /** Clippy's reaction when the user picks the refusal option, in the real
  * paperclip's voice: he takes it personally, quietly. */
 const REFUSAL_REACTIONS = [
@@ -128,12 +127,40 @@ export type ClippySendUserMessage = (
   options?: { deliverAs?: 'steer' | 'followUp'; expandPromptTemplates?: boolean },
 ) => void
 
+/** Timeline knobs for the background-thinking layer. Production uses the
+ * defaults overlaid with the config dials; tests shrink them so a thought
+ * can be provoked in milliseconds. */
+export interface IdleThinkTimings {
+  /** How often the runtime checks whether the session has been idle long
+   * enough for a background thought. */
+  readonly pollMs: number
+  /** Quiet time before the first thought (config: idleThinkAfterMs). */
+  readonly thinkAfterMs: number
+  /** Minimum quiet time between thoughts (config: idleThinkCooldownMs). */
+  readonly cooldownMs: number
+  /** Cap on one thought's model call, so a stuck model never leaves the
+   * paperclip frozen in the thinking pose. */
+  readonly maxThoughtMs: number
+}
+
+export const DEFAULT_IDLE_THINK_TIMINGS: IdleThinkTimings = {
+  pollMs: 15_000,
+  thinkAfterMs: 120_000,
+  cooldownMs: 300_000,
+  maxThoughtMs: 60_000,
+}
+
 export interface ClippyRuntimeOptions {
   readonly renderer: 'external' | 'ascii'
   readonly viewer?: ClippyViewer
   readonly config?: ClippyConfig
   /** Timing overrides for the buddy messaging layer (tests shrink them). */
   readonly buddyTimings?: Partial<BuddyTimings>
+  /** Timing overrides for the background-thinking layer (tests shrink them). */
+  readonly idleThinkTimings?: Partial<IdleThinkTimings>
+  /** The background thought generator. Tests inject a fake decision so no
+   * model route is needed; production uses generateIdleThought. */
+  readonly thoughtGenerator?: (ctx: ExtensionContext, signal: AbortSignal, route: ClippyModelRouteOverride) => Promise<IdleThought>
   /** Deliver a chosen balloon answer into the pi session as a user message
    * (the extension wires this to pi.sendUserMessage; undefined disables it). */
   readonly sendUserMessage?: ClippySendUserMessage
@@ -156,6 +183,16 @@ export class ClippyRuntime {
   private lastCommentaryAt = 0
   private pendingError = false
   private chatterTimer: ReturnType<typeof setTimeout> | undefined
+  /** Background thinking: the idle-watch poll loop, the abort handle for a
+   * thought in flight, and the quiet clock (idleSince) plus thought spacing
+   * (lastThoughtAt). */
+  private idleThinkTimer: ReturnType<typeof setInterval> | undefined
+  private idleThinkAbort: AbortController | undefined
+  private idleThinking = false
+  private idleSince = 0
+  private lastThoughtAt = 0
+  private readonly idleThinkTimings: IdleThinkTimings
+  private readonly thoughtGenerator: (ctx: ExtensionContext, signal: AbortSignal, route: ClippyModelRouteOverride) => Promise<IdleThought>
   /** When the session climate was last derived (throttle, see above). */
   private lastClimateAt = 0
   /** The choice buttons currently shown in the balloon (if any). */
@@ -163,7 +200,6 @@ export class ClippyRuntime {
   /** Short subject of the offer behind the current choices (e.g. "the
    * chart"), so picking an option echoes what was actually offered. */
   private lastOfferSubject: string | undefined
-  private choicesMade = 0
   /** The balloon the current buttons belong to. A pressed button acts on
    * what the user actually read, so the effect is built from this text. */
   private lastBalloonAsk: string | undefined
@@ -174,6 +210,9 @@ export class ClippyRuntime {
   /** The most recent reading of the room, kept so a choice reaction and an
    * angry line can consult it without walking the evidence again. */
   private lastClimate: SessionClimate | undefined
+  /** What touchSession found at start() — a milestone, a break, a grace
+   * save, or nothing notable — for the first greeting of the day to react to. */
+  private lastStreakEvent: StreakEvent | undefined
   private recentOfficeTasks: OfficeTask[] = []
   private readonly renderer: 'external' | 'ascii'
   private readonly viewer: ClippyViewer | undefined
@@ -207,19 +246,37 @@ export class ClippyRuntime {
     this.offers = new OfferTracker(
       (text, offerChoices, offerSubject) => this.showBalloon(text, offerChoices ?? true, offerSubject),
       () => !this.disposed,
-      // Being ignored is one of the things he holds against you.
-      () => { this.grievance += 1 },
+      // An unanswered offer resolves itself one of three ways: he decides
+      // FOR you and really carries it out (no grudge — he was being useful),
+      // he gets annoyed and drops it himself (a real snub, same as a no), or
+      // he simply lets it go without a word (no grudge, no fanfare — the
+      // desktop is just free again for whatever comes next).
+      (outcome, offerText, label) => {
+        if (outcome === 'accepted') {
+          void this.triggerOfferAction(label, offerText)
+          return
+        }
+        if (outcome === 'dismissed') this.grievance += 1
+      },
     )
+    this.idleThinkTimings = {
+      ...DEFAULT_IDLE_THINK_TIMINGS,
+      thinkAfterMs: this.config.idleThinkAfterMs,
+      cooldownMs: this.config.idleThinkCooldownMs,
+      ...options.idleThinkTimings,
+    }
+    this.thoughtGenerator = options.thoughtGenerator ?? generateIdleThought
   }
 
   start(): void {
-    touchSession()
+    this.lastStreakEvent = touchSession().event
     this.lastBalloonLeafId = this.ctx.sessionManager.getLeafId() ?? undefined
     this.lastCommentaryAt = 0
     this.pendingError = false
     this.setState('idle')
     this.scheduleIdleMotion()
     this.scheduleChatter()
+    this.scheduleIdleThink()
     this.greetingTimer = setTimeout(() => {
       this.maybeGreet()
     }, GREETING_DELAY_MS)
@@ -232,6 +289,10 @@ export class ClippyRuntime {
       if (timer !== undefined) clearTimeout(timer)
     }
     this.animTimer = this.flashTimer = this.idleTimer = this.commentaryTimer = this.watchTimer = this.balloonTimer = this.greetingTimer = this.chatterTimer = undefined
+    if (this.idleThinkTimer !== undefined) clearInterval(this.idleThinkTimer)
+    this.idleThinkTimer = undefined
+    if (this.idleThinkAbort !== undefined) this.idleThinkAbort.abort()
+    this.idleThinkAbort = undefined
     this.offers.dispose()
     this.buddies.dispose()
     if (this.renderer === 'ascii' && this.ctx.hasUI) {
@@ -243,6 +304,7 @@ export class ClippyRuntime {
   // --- Agent event feed ---------------------------------------------------
 
   onTurnStart(): void {
+    this.cancelIdleThought()
     this.setState('thinking')
   }
 
@@ -386,7 +448,7 @@ export class ClippyRuntime {
       // this line only. Returning before re-arming used to end idle chatter
       // for the rest of the session.
       this.scheduleChatter()
-      if (!this.ctx.hasUI || this.generating) return
+      if (!this.ctx.hasUI || this.generating || this.idleThinking) return
       const signal = AbortSignal.timeout(GENERATION_TIMEOUT_MS)
       generateChatterLine(this.ctx, signal, 'clippy', this.route())
         .then(text => {
@@ -397,6 +459,121 @@ export class ClippyRuntime {
           // No model route yet; chatter stays silent and retries later.
         })
     }, delay)
+  }
+
+  // --- Background thinking --------------------------------------------------
+
+  /** Clippy thinks in the background while the session is quiet. A polling
+   * loop watches for a long enough idle stretch, then hands the room to one
+   * private thought; what he decides to DO with it (a chat with a buddy, an
+   * offer, a remark) reaches the desktop — the thought itself does not. */
+  private scheduleIdleThink(): void {
+    if (this.disposed) return
+    if (this.idleThinkTimer !== undefined) clearInterval(this.idleThinkTimer)
+    this.idleThinkTimer = setInterval(() => {
+      this.tickIdleThink()
+    }, this.idleThinkTimings.pollMs)
+    this.idleThinkTimer.unref?.()
+  }
+
+  private tickIdleThink(): void {
+    if (this.disposed || !this.config.idleThinking || !this.ctx.hasUI) return
+    const now = Date.now()
+    if (!this.ctx.isIdle()) {
+      // Activity resets the quiet clock: he thinks only in lulls.
+      this.idleSince = now
+      return
+    }
+    if (this.generating || this.idleThinking) return
+    if (this.idleSince === 0) this.idleSince = now
+    if (now - this.idleSince < this.idleThinkTimings.thinkAfterMs) return
+    if (now - this.lastThoughtAt < this.idleThinkTimings.cooldownMs) return
+    this.lastThoughtAt = now
+    void this.thinkIdle()
+  }
+
+  /** One quiet background thought: Clippy poses in the thinking animation,
+   * asks the model what he feels like doing, and acts on the decision. A
+   * user turn aborts the thought mid-flight — the room belongs to the work
+   * again, and a half-formed impulse is discarded. */
+  private async thinkIdle(): Promise<void> {
+    if (this.disposed || this.generating || this.idleThinking) return
+    this.idleThinking = true
+    const abort = new AbortController()
+    this.idleThinkAbort = abort
+    const previous = this.state
+    this.setState('thinking')
+    try {
+      const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(this.idleThinkTimings.maxThoughtMs)])
+      const thought = await this.thoughtGenerator(this.ctx, signal, this.route())
+      if (this.disposed || abort.signal.aborted) return
+      this.actOnIdleThought(thought)
+    } catch {
+      // Aborted (the user came back) or no model route yet: he simply waits.
+    } finally {
+      this.idleThinking = false
+      this.idleThinkAbort = undefined
+      this.idleSince = Date.now()
+      if (!this.generating && this.state === 'thinking') {
+        this.setState(previous === 'thinking' ? 'idle' : previous)
+      }
+    }
+  }
+
+  /** The same guardrails as every other Clippy behavior: a chat summons
+   * only a configured rival he is willing to send for (cameoChance), an
+   * offer rides the real option buttons (a Yes keeps its existing promise),
+   * and a remark is just words. No thought ever edits a file. */
+  private actOnIdleThought(thought: IdleThought): void {
+    const statement = thought.statement.trim()
+    if (statement === '' || thought.action === 'nothing') return
+    if (thought.action === 'chat') {
+      this.actOnChatThought(thought.agent, statement)
+      return
+    }
+    const line = renderClippyResponseWithPersonality({ statement })
+    if (thought.action === 'offer') {
+      // An offer line asks "Would you like help...?": the real buttons
+      // appear, and the nag/snooze machinery treats it like any offer.
+      this.showBalloon(line, true)
+      return
+    }
+    // remark: one small thought spoken out loud, no buttons.
+    this.showBalloon(line, false)
+  }
+
+  /** The chat impulse: Clippy wanted company. Only an external-renderer
+   * session can honor it, and the cameoChance dial decides whether the
+   * impulse becomes a call — 0 means he never calls anyone. A friend
+   * already on the desktop is simply talked to; otherwise he says his line
+   * out loud and sends for the rival, whose arrival reacts to exactly those
+   * words and the existing crosstalk layer carries the chat on. */
+  private actOnChatThought(agent: string | undefined, statement: string): void {
+    if (this.renderer !== 'external' || this.viewer === undefined
+      || agent === undefined || !this.config.cameos.includes(agent)) {
+      return
+    }
+    const line = renderClippyResponseWithPersonality({ statement })
+    if (this.viewer.isCameoOpen(agent)) {
+      this.showBalloon(line, false)
+      // Talk to whoever is listening — the friend is already there.
+      this.buddies.scheduleCrosstalk('clippy', line)
+      return
+    }
+    if (this.config.cameoChance <= 0) return
+    if (this.config.cameoChance < 1 && Math.random() >= this.config.cameoChance) return
+    this.showBalloon(line, false)
+    void this.buddies.summonBuddy(agent, 'clippy')
+  }
+
+  /** The user is back: abandon a half-formed background thought. The poll
+   * loop keeps running and re-arms the quiet clock on its own. */
+  private cancelIdleThought(): void {
+    if (this.idleThinkAbort !== undefined) {
+      this.idleThinkAbort.abort()
+      this.idleThinkAbort = undefined
+    }
+    this.idleSince = 0
   }
 
   // --- Character layer (delegates to BuddyCoordinator) ----------------------
@@ -429,10 +606,19 @@ export class ClippyRuntime {
     this.buddies.inviteToParty()
   }
 
-  /** /clippy stats: current stats as a balloon. */
+  /** /clippy stats: current stats (streak, tests, and rank) as a balloon. */
   triggerStats(): void {
     if (this.disposed) return
-    this.showBalloon(this.renderOfficeBalloon(greetingStatement(loadStats())))
+    this.showBalloon(this.renderOfficeBalloon(statsStatement(loadStats())))
+  }
+
+  /** A streak milestone: the same fanfare /clippy party gets, with a line
+   * about the milestone instead of a generic celebration. */
+  private triggerStreakMilestone(streak: number): void {
+    if (this.disposed) return
+    this.viewer?.broadcast('clippy', { type: 'party' })
+    this.showBalloon(this.renderOfficeBalloon(milestoneStatement(streak)))
+    this.buddies.inviteToParty()
   }
 
   /** The user picked one of the little option buttons in the balloon.
@@ -441,16 +627,16 @@ export class ClippyRuntime {
    * the user read decides what happens (src/actions.ts). "Show me" makes him
    * explain the change, "What next?" makes him propose a step, "Be honest"
    * gets the unvarnished version, "Second opinion" sends for a rival, and a
-   * plain yes puts a genuine request into the pi session. Refusals still
-   * start the authentic paperclip nag (src/offers.ts): he re-asks, sullenly,
-   * and after a couple of noes offers "Don't show this tip again", which
-   * really works — and each no is filed away against his temper. */
+   * plain yes makes Clippy carry the offer out himself with his file powers.
+   * Refusals still start the authentic paperclip nag (src/offers.ts): he
+   * re-asks, sullenly, and after a couple of noes offers "Don't show this
+   * tip again", which really works — and each no is filed away against his
+   * temper. */
   onChoice(index: number, label?: string): void {
     if (this.disposed || !this.viewer || this.lastChoices === undefined) return
     const choices = this.lastChoices
     this.lastChoices = undefined
     const pick = (typeof label === 'string' && label.length > 0) ? label : (choices[index] ?? choices[0] ?? 'Yes')
-    const subject = this.lastOfferSubject
     const asked = this.lastBalloonAsk ?? ''
     this.lastOfferSubject = undefined
     const effect = effectForLabel(pick)
@@ -466,22 +652,22 @@ export class ClippyRuntime {
       this.showBalloon(this.refusalLine(pick), false)
       return
     }
-    this.choicesMade += 1
-    // Do the thing the button promised, then say something about doing it.
+    // Do the thing the button promised: the label decides what the model
+    // does, and which of Clippy's file powers (if any) it may use.
     this.applyChoiceEffect(effect, pick, asked)
-    this.acknowledgeChoice(effect, pick, asked, subject)
   }
 
   /** Keep the button's promise. Everything here is something the user can
-   * see happen: a real request in the session, a real explanation, a rival
-   * actually arriving. */
+   * see happen: a real explanation, a rival actually arriving, or — for a
+   * yes — Clippy himself carrying out the offer with his file powers. The
+   * effect comes from the visible label, never from hidden text. */
   private applyChoiceEffect(effect: ChoiceEffect, pick: string, asked: string): void {
     switch (effect) {
       case 'accept':
-        // A real answer to Clippy becomes a real user message in pi, built
-        // from the balloon the user just read (never from anything hidden).
-        this.insertUserMessage(asked === '' ? pick : acceptanceMessage(asked, pick))
-        this.flash('writing', CELEBRATE_MS)
+        // The yes button is the only one that hands the model edit powers:
+        // Clippy now actually does the thing the balloon offered, reading
+        // the project and (when it genuinely helps) making one small edit.
+        void this.triggerOfferAction(pick, asked)
         return
       case 'explain':
         void this.triggerExplain()
@@ -525,40 +711,6 @@ export class ClippyRuntime {
     else if (effect === 'stats') this.triggerStats()
   }
 
-  /** Clippy's own line about the button that was pressed: generated so it
-   * responds to THAT choice on THAT offer, with the canned reactions as the
-   * fallback when the model is unavailable. Effects that already produce a
-   * balloon of their own (explain, suggest, roast, stats, party, and the
-   * summons announcement) are left to speak for themselves. */
-  private acknowledgeChoice(effect: ChoiceEffect, pick: string, asked: string, subject?: string): void {
-    // Only a plain acceptance needs a line of its own: every other effect
-    // already produces a balloon (the explanation, the roast, the "I have
-    // sent for Bonzi" announcement) and would otherwise be introduced twice.
-    if (effect !== 'accept') return
-    const canned = this.cannedChoiceLine(pick, subject)
-    if (asked === '' || this.generating) {
-      this.showBalloon(canned, false)
-      return
-    }
-    const signal = AbortSignal.timeout(GENERATION_TIMEOUT_MS)
-    generateChoiceReplyLine(this.ctx, signal, 'clippy', effect, pick, asked, this.route())
-      .then(text => {
-        if (!this.disposed) this.showBalloon(text, false)
-      })
-      .catch(() => {
-        if (!this.disposed) this.showBalloon(canned, false)
-      })
-  }
-
-  /** The classic canned delight, kept for when the model cannot be reached. */
-  private cannedChoiceLine(pick: string, subject?: string): string {
-    if (this.choicesMade >= 4 && Math.random() < 0.4) {
-      return `You have now made ${this.choicesMade} excellent decisions.${subject ? ` ${subject} is taking shape nicely.` : ''} I am keeping a chart.`
-    }
-    const reaction = CHOICE_REACTIONS[Math.floor(Math.random() * CHOICE_REACTIONS.length)]
-    return `You chose "${pick}".${subject ? ` ${subject} — ` : ' '}${reaction}`
-  }
-
   /** Being turned down. Usually he takes it with wounded grace; on the rare
    * occasion that a bad session and a session's worth of being ignored have
    * both piled up, the paperclip finally says what he thinks (src/temper.ts). */
@@ -574,8 +726,7 @@ export class ClippyRuntime {
   /** A buddy's option buttons work the same way, in the buddy's own voice. */
   onBuddyChoice(agent: string, index: number, label?: string): void {
     const pick = (typeof label === 'string' && label.length > 0) ? label : undefined
-    const reaction = CHOICE_REACTIONS[Math.floor(Math.random() * CHOICE_REACTIONS.length)] ?? 'Excellent.'
-    this.buddies.onBuddyChoice(agent, index, reaction, pick)
+    this.buddies.onBuddyChoice(agent, index, undefined, pick)
   }
 
   /** Deliver a chosen balloon answer into the pi session as a user message,
@@ -595,10 +746,28 @@ export class ClippyRuntime {
     // On a holiday the first greeting of the day is about the day, not about
     // your streak — the paperclip has priorities.
     const occasion = this.occasion()
-    const statement = occasion?.holiday === undefined
-      ? greetingStatement(loadStats())
-      : seasonalStatement(occasion)
-    this.showBalloon(this.renderOfficeBalloon(statement))
+    if (occasion?.holiday !== undefined) {
+      this.showBalloon(this.renderOfficeBalloon(seasonalStatement(occasion)))
+      return
+    }
+    // Otherwise the streak gets to react to what actually happened: a real
+    // celebration for a milestone, a somber line for a broken streak, an
+    // acknowledgment when insurance quietly covered a missed day — and only
+    // the plain stats line when none of that is going on.
+    const event = this.lastStreakEvent
+    if (event?.kind === 'broken' && event.brokenStreak >= 2) {
+      this.showBalloon(this.renderOfficeBalloon(mourningStatement(event.brokenStreak)))
+      return
+    }
+    if ((event?.kind === 'continued' || event?.kind === 'grace-saved') && event.milestone !== undefined) {
+      this.triggerStreakMilestone(event.milestone)
+      return
+    }
+    if (event?.kind === 'grace-saved') {
+      this.showBalloon(this.renderOfficeBalloon(graceSavedStatement(event.streak, event.tokensLeft)))
+      return
+    }
+    this.showBalloon(this.renderOfficeBalloon(greetingStatement(loadStats())))
   }
 
   /** What time of year it is, or undefined when the user turned the seasonal
@@ -665,6 +834,20 @@ export class ClippyRuntime {
     )
   }
 
+  /** Reply to text supplied after `/clippy`; the normal balloon flow then
+   * lets every open buddy hear Clippy's reply and choose whether to answer. */
+  async triggerUserMessage(message: string): Promise<void> {
+    const trimmed = message.trim()
+    if (trimmed === '') {
+      await this.triggerBalloon(true)
+      return
+    }
+    await this.runBalloon(signal =>
+      generateClippyReply(this.ctx, signal, trimmed, this.route()),
+      true,
+    )
+  }
+
   /** Right-click menu: explain the most recent change. */
   async triggerExplain(): Promise<void> {
     await this.runBalloon(signal =>
@@ -689,8 +872,21 @@ export class ClippyRuntime {
     )
   }
 
+  /** The "Yes" button: Clippy carries out the offer himself. The offer text
+   * and the pressed label decide the task; the model gets read+edit powers
+   * inside the project (src/files.ts) and reports what it actually did. */
+  async triggerOfferAction(pick: string, asked: string): Promise<void> {
+    await this.runBalloon(signal =>
+      generateOfferAction(this.ctx, signal, asked, pick, this.route()),
+      true,
+    )
+  }
+
   private async runBalloon(generate: (signal: AbortSignal) => Promise<ClippyBalloon>, manual: boolean): Promise<void> {
     if (this.disposed || this.generating) return
+    // A real request owns the room: any half-formed background thought is
+    // dropped so it can never collide with the user's moment.
+    this.cancelIdleThought()
     recordTestResultsFromEntries(this.ctx.sessionManager.buildContextEntries())
     const previous = this.state
     this.generating = true
@@ -734,6 +930,9 @@ export class ClippyRuntime {
       this.offers.onBalloonShown(text, choices, offerSubject)
       this.lastBalloonAsk = choices === undefined ? this.lastBalloonAsk : text
       this.viewer?.broadcast('clippy', { type: 'balloon', text, choices })
+      // Every Clippy line flows through the permission scanner: a grant he
+      // spoke becomes a real, session-scoped read grant for the named buddy.
+      this.buddies.noteSpoken('clippy', text)
       // An open buddy may answer Clippy's line — a real conversation.
       if (offerChoices !== false) {
         this.buddies.scheduleCrosstalk('clippy', text)

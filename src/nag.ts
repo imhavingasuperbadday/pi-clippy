@@ -67,6 +67,16 @@ export function ignoredOfferLine(subject: string): string {
   return `It looks like you did not answer my question about ${what}. I have taken that as a yes.`
 }
 
+/** Balloon for an offer Clippy gives up on himself: not a "no" from you, a
+ * mildly wounded surrender after being left hanging. Distinct from
+ * ignoredOfferLine (silence taken as a yes) and from a silent drop (no
+ * balloon at all) — this is the third, annoyed way an unanswered offer can
+ * end. */
+export function dismissedOfferLine(subject: string): string {
+  const what = subject === '' ? 'my earlier offer' : subject
+  return `It looks like you are not going to answer about ${what}. Fine. I will decide that one myself: no.`
+}
+
 /** Reaction to pressing "Don't show this tip again". */
 export function snoozeLine(subject: string): string {
   const what = subject === '' ? 'that tip' : subject

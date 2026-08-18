@@ -14,15 +14,23 @@
  * - **one at a time**: the renderer serializes delivery (a shared floor), so
  *   a buddy's message never lands on top of (or right after) Clippy's —
  *   each message is read before the next is voiced;
+ * - **fair**: reply slots are shuffled among the open listeners, so no pair
+ *   monopolizes the mic just because it sits early in the roster;
  * - **bounded**: each pair gets a capped number of exchanges per cooldown
  *   window, so two windows can argue but never talk forever;
  * - **thread-aware**: the model sees the pair's recent history, so a
- *   counter-reply references the actual exchange;
+ *   counter-reply references the actual exchange; only lines that were
+ *   actually answered enter the transcript;
  * - **reliable**: replies retry with backoff instead of being silently
  *   dropped when Clippy is mid-generation;
- * - **never dropped**: a buddy's line is always answered (Clippy guarantees
- *   an acknowledgment even when everyone rolls past the chance), and every
- *   agent gets a canned fallback in its own voice when the model is stuck.
+ * - **never dropped**: a buddy's line is always answered — Clippy guarantees
+ *   an acknowledgment when everyone rolls past the chance (retired if a
+ *   real reply lands first), and every agent gets a canned fallback in its
+ *   own voice when the model is stuck.
+ * - **file access**: Clippy reads on his own and edits only when a yes
+ *   button authorizes it; buddies have nothing unless Clippy grants read
+ *   access — rare, per-buddy once, and only after they convince him
+ *   (src/permission.ts scans every spoken line for the request/grant).
  */
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent'
 import {
@@ -30,16 +38,18 @@ import {
   BANTER_PARTNERS,
   banterRebuttal,
   banterReply,
+  buddyChoiceFallback,
   buddyMenuLine,
   cannedReplyFor,
   castForMood,
   environmentLine,
+  openingGreeting,
   summonAnnouncement,
-  summonGreeting,
   turnOffLine,
   userTalkLine,
   type BuddyState,
 } from './cameos.ts'
+import { loadStats } from './stats.ts'
 import type { ClippyConfig } from './config.ts'
 import {
   acceptanceMessage,
@@ -59,6 +69,8 @@ import {
 } from './generator.ts'
 import { isRemarkable, type SessionClimate } from './mood.ts'
 import { asksForHelp } from './response.ts'
+import { buddyRequestsFileAccess, clippyGrantsFileAccess } from './permission.ts'
+import { NO_FILE_POWERS, READ_ONLY, type FilePowers } from './files.ts'
 import type { ClippyViewer } from './viewer.ts'
 
 const GENERATION_TIMEOUT_MS = 90_000
@@ -69,8 +81,7 @@ const OPENING_TIMEOUT_MS = 8_000
 /** Cameo banter: a buddy may conjure a partner to argue with. */
 const BANTER_REBUTTAL_DELAY_MS = 8_000
 /** Annoyance arc: Clippy may tire of a repeat interrupter and turn it off. */
-const ANNOYED_TURNOFF_DELAY_MS = 6_000
-/** A rival that keeps interrupting after the first visit sticks around. */
+const ANNOYED_TURNOFF_DELAY_MS = 6_000/** A rival that keeps interrupting after the first visit sticks around. */
 const PERSIST_AFTER_INTERRUPTS = 2
 /** Clippy tolerates this many of a buddy's quips before considering a turn-off. */
 const ANNOYED_AFTER_QUIPS = 4
@@ -90,6 +101,9 @@ const ENVIRONMENT_REACTION_CHANCE = 0.45
 const ENVIRONMENT_REACTION_DELAY_MS = 4_000
 /** The same room does not get remarked on twice inside this window. */
 const ENVIRONMENT_REACTION_COOLDOWN_MS = 120_000
+/** File access: Clippy reads on his own; a buddy reads only after Clippy
+ * granted it (rarely, and only after being convinced). */
+const MAX_READ_GRANTS_PER_SESSION = 2
 /** Crosstalk volume scaling by mood. When the session is going badly the
  * user does not want three windows arguing over the wreckage — the buddies
  * still *react to the event* (that is on-topic and short), they just stop
@@ -198,6 +212,19 @@ export class BuddyCoordinator {
   /** When a buddy last remarked on the session, so a run of events does not
    * turn into a run of commentary. */
   private lastEnvironmentReactionAt = 0
+  /** The guaranteed "never left hanging" acknowledgment currently pending
+   * for a buddy's line (if any), so a real reply can supersede it instead
+   * of Clippy answering a conversation that has already moved on. */
+  private pendingAck: { speaker: string; line: string; timer: ReturnType<typeof setTimeout> } | undefined
+  /** Who may read the project files. Clippy always may; a buddy joins only
+   * when Clippy grants it — rare, per-buddy once, and only after the buddy
+   * asked and convinced him (see noteSpoken). Buddies NEVER edit. */
+  private readonly readAccess = new Set<string>(['clippy'])
+  /** A buddy's pending, unanswered request to read files (agent -> the line
+   * that asked). Cleared on grant, turn-off, and session end. */
+  private readonly pendingReadRequests = new Map<string, string>()
+  /** Grants Clippy has issued this session (the hard cap on generosity). */
+  private readGrantsIssued = 0
   /** Effective messaging timeline (defaults overlaid with any override). */
   private readonly t: BuddyTimings
 
@@ -213,27 +240,81 @@ export class BuddyCoordinator {
 
   /** Track a pending timer so dispose/cancelBanter can cancel it, and drop
    * it from the list once it has fired. Crosstalk schedules a timer per
-   * reply, so without the self-pruning the list grew for the whole session. */
-  private track(fn: () => void, delayMs: number): void {
+   * reply, so without the self-pruning the list grew for the whole session.
+   * Returns the handle so a specific timer (the guaranteed acknowledgment)
+   * can be cancelled individually. */
+  private track(fn: () => void, delayMs: number): ReturnType<typeof setTimeout> {
     const timer = setTimeout(() => {
       const index = this.banterTimers.indexOf(timer)
       if (index >= 0) this.banterTimers.splice(index, 1)
       fn()
     }, delayMs)
     this.banterTimers.push(timer)
+    return timer
+  }
+
+  /** Cancel one tracked timer and forget it, without touching the others. */
+  private untrack(timer: ReturnType<typeof setTimeout>): void {
+    clearTimeout(timer)
+    const index = this.banterTimers.indexOf(timer)
+    if (index >= 0) this.banterTimers.splice(index, 1)
   }
 
   dispose(): void {
     this.disposed = true
     for (const timer of this.banterTimers) clearTimeout(timer)
     this.banterTimers = []
+    this.pendingAck = undefined
     this.buddyStates.clear()
     this.buddyQuips.clear()
     this.threads.clear()
+    this.readAccess.clear()
+    this.pendingReadRequests.clear()
   }
 
   private get viewer(): ClippyViewer | undefined {
     return this.host.viewer
+  }
+
+  /** The file powers a buddy's next generation may use. Read-only, and only
+   * after Clippy granted it (never edit, never before the grant). */
+  private powersFor(agent: string): FilePowers {
+    return agent === 'clippy' || this.readAccess.has(agent) ? READ_ONLY : NO_FILE_POWERS
+  }
+
+  /** Does this agent currently hold read access to the project files? */
+  canRead(agent: string): boolean {
+    return this.readAccess.has(agent)
+  }
+
+  /** Every line any assistant speaks passes through here, which makes it the
+   * single place the file-access permission dance is decided:
+   *
+   * - a buddy line asking to read the files registers a pending request;
+   * - a Clippy line that plainly grants that buddy (naming it) turns the
+   *   request into a session-scoped, read-only grant.
+   *
+   * The convincing itself happens in the conversation — Clippy's prompts
+   * make him stingy (src/generator.ts); the caps here make the rarity
+   * structural: a request must come first, and the whole session allows
+   * only a couple of grants. */
+  noteSpoken(agent: string, line: string): void {
+    if (this.disposed || line === '') return
+    if (agent === 'clippy') {
+      if (this.readGrantsIssued >= MAX_READ_GRANTS_PER_SESSION) return
+      for (const [buddy] of [...this.pendingReadRequests]) {
+        if (this.readAccess.has(buddy)) continue
+        if (this.viewer !== undefined && !this.viewer.isCameoOpen(buddy)) continue
+        if (!clippyGrantsFileAccess(line, buddy)) continue
+        this.readAccess.add(buddy)
+        this.readGrantsIssued += 1
+        this.pendingReadRequests.delete(buddy)
+      }
+      return
+    }
+    if (!this.readAccess.has(agent) && buddyRequestsFileAccess(line)) {
+      this.pendingReadRequests.set(agent, line)
+    }
   }
 
   // --- Reading the room ----------------------------------------------------
@@ -267,9 +348,20 @@ export class BuddyCoordinator {
     const agent = castForMood(climate.mood, open, Math.random(), Math.random())
     if (agent === undefined) return
     this.lastEnvironmentReactionAt = now
+    this.scheduleEnvironmentReaction(agent, climate, 0)
+  }
+
+  /** A buddy remarking on the session, with the same bounded retry the
+   * replies get: a line that finds Clippy mid-generation waits it out
+   * instead of being silently dropped, so a notable event is not lost to
+   * timing alone. */
+  private scheduleEnvironmentReaction(agent: string, climate: SessionClimate, attempt: number): void {
     this.track(() => {
       if (this.disposed || this.viewer?.isCameoOpen(agent) !== true) return
-      if (this.host.isGenerating()) return
+      if (this.host.isGenerating()) {
+        if (attempt < REPLY_RETRY_ATTEMPTS) this.scheduleEnvironmentReaction(agent, climate, attempt + 1)
+        return
+      }
       const signal = AbortSignal.timeout(GENERATION_TIMEOUT_MS)
       generateReactionLine(this.ctx, signal, agent, climate, this.modelRoute())
         .then(text => {
@@ -278,7 +370,7 @@ export class BuddyCoordinator {
         .catch(() => {
           if (!this.disposed) this.buddySay(agent, environmentLine(agent, climate.mood), false)
         })
-    }, ENVIRONMENT_REACTION_DELAY_MS)
+    }, attempt === 0 ? ENVIRONMENT_REACTION_DELAY_MS : this.t.retryBackoffMs)
   }
 
   /** How likely a listener is to answer a line right now. Flat config chance,
@@ -333,7 +425,10 @@ export class BuddyCoordinator {
     const asked = this.host.lastLineBy(agent) ?? this.host.lastLineBy('clippy') ?? ''
     const signal = AbortSignal.timeout(GENERATION_TIMEOUT_MS)
     const asAsked = kind === 'explain' ? 'Show me' : kind === 'suggest' ? 'What next?' : 'Be honest'
-    generateChoiceReplyLine(this.ctx, signal, agent, kind, asAsked, asked, this.modelRoute())
+    // "Show me" / "What next?" are the tasks where a granted buddy may use
+    // its read access; the roast is pure talk.
+    const powers = kind === 'explain' || kind === 'suggest' ? this.powersFor(agent) : NO_FILE_POWERS
+    generateChoiceReplyLine(this.ctx, signal, agent, kind, asAsked, asked, this.modelRoute(), powers)
       .then(text => {
         if (!this.disposed) this.buddySay(agent, text, false)
       })
@@ -355,10 +450,13 @@ export class BuddyCoordinator {
     record.appeared += 1
     record.summonedBy = by
     if (announce) this.announceSummon(by, target)
-    const fallback = summonGreeting(target, record)
+    // Usually the memory-aware summon greeting; occasionally a jab at the
+    // user's streak instead, when there is one worth mocking.
+    const fallback = openingGreeting(target, record, loadStats().streak, Math.random())
     const context = by === 'clippy' ? this.host.lastLineBy('clippy') : this.host.lastLineBy(by)
     const greeting = await this.openingLine(target, context, fallback)
     if (this.disposed || !this.viewer) return
+    this.noteSpoken(target, greeting)
     this.viewer.summonCameo(target, greeting, choiceSetFor(greeting))
     // The newly arrived buddy's line is heard by everyone else.
     this.scheduleCrosstalk(target, greeting)
@@ -420,6 +518,9 @@ export class BuddyCoordinator {
   turnOffBuddy(by: string, victim: string): void {
     if (this.disposed || !this.viewer || by === victim) return
     this.cancelBanter()
+    // A buddy that is switched off mid-plea stops asking; the grant itself
+    // (if one was earned) is remembered for the session.
+    this.pendingReadRequests.delete(victim)
     const victimRecord = this.buddyRecord(victim)
     victimRecord.turnedOffBy = by
     const byRecord = by === 'clippy' ? undefined : this.buddyRecord(by)
@@ -434,9 +535,11 @@ export class BuddyCoordinator {
   /** The user picked one of a buddy's option buttons. The buttons on a
    * buddy balloon work exactly like Clippy's: the label says what happens,
    * and the buddy answers in its own voice about the thing that is actually
-   * about to happen (src/actions.ts). `fallbackReaction` is the canned line
-   * used only when the model is unavailable. */
-  onBuddyChoice(agent: string, _index: number, fallbackReaction: string, label?: string): void {
+   * about to happen (src/actions.ts). The canned line is drawn from the
+   * buddy's OWN voice (src/cameos.ts) so a model outage never makes a
+   * buddy answer in Clippy's words; `fallbackReaction` overrides it for
+   * callers that bring their own. */
+  onBuddyChoice(agent: string, _index: number, fallbackReaction?: string, label?: string): void {
     if (this.disposed || !this.viewer || !this.viewer.isCameoOpen(agent)) return
     const pick = (typeof label === 'string' && label.trim().length > 0) ? label.trim() : 'Yes'
     const effect = effectForLabel(pick)
@@ -444,13 +547,18 @@ export class BuddyCoordinator {
     // The button's promise is kept first, so the reply lands on something
     // that is already happening.
     this.applyBuddyEffect(agent, effect, pick, asked)
+    const fallback = fallbackReaction ?? buddyChoiceFallback(agent, effect)
     const signal = AbortSignal.timeout(GENERATION_TIMEOUT_MS)
-    generateChoiceReplyLine(this.ctx, signal, agent, effect, pick, asked, this.modelRoute())
+    // Only the "real work" buttons (explain, suggest) may spend a granted
+    // buddy's read access; accept, party, stats and the rest never touch
+    // the files, and no buddy ever edits.
+    const powers = effect === 'explain' || effect === 'suggest' ? this.powersFor(agent) : NO_FILE_POWERS
+    generateChoiceReplyLine(this.ctx, signal, agent, effect, pick, asked, this.modelRoute(), powers)
       .then(text => {
         if (!this.disposed) this.buddySay(agent, text, false)
       })
       .catch(() => {
-        if (!this.disposed) this.buddySay(agent, fallbackReaction, false)
+        if (!this.disposed) this.buddySay(agent, fallback, false)
       })
   }
 
@@ -478,6 +586,7 @@ export class BuddyCoordinator {
    * may answer the line. */
   buddySay(agent: string, text: string, offerChoices = true): void {
     if (this.disposed || !this.viewer) return
+    this.noteSpoken(agent, text)
     if (offerChoices) {
       this.viewer.sayTo(agent, text, choiceSetFor(text))
       // Clippy (or another open buddy) may answer the buddy's line.
@@ -528,7 +637,14 @@ export class BuddyCoordinator {
 
   /** Have the opener conjure a partner, then rebut it. Both remember the
    * argument for the rest of the session; the partner sticks around, and the
-   * opener may eventually tire of it and turn it off. */
+   * opener may eventually tire of it and turn it off.
+   *
+   * The rebuttal travels through the SAME threaded channel as every other
+   * reply (scheduleReply), so the banter counts against the pair's exchange
+   * budget, lands in the pair's transcript, can draw a mic-back, and cools
+   * the pair down afterwards — a banter argument is a real, bounded
+   * argument instead of a one-off exchange that later lines cannot
+   * remember. */
   private scheduleBanter(agent: string): void {
     const preferred = BANTER_PARTNERS[agent]
     const partner = preferred !== undefined && this.config.cameos.includes(preferred)
@@ -539,22 +655,14 @@ export class BuddyCoordinator {
     const partnerRecord = this.buddyRecord(partner)
     if (!opener.arguedWith.includes(partner)) opener.arguedWith.push(partner)
     partnerRecord.appeared += 1
+    partnerRecord.summonedBy = agent
     const line = banterReply(agent, partnerRecord)
+    this.noteSpoken(partner, line)
     this.viewer?.summonCameo(partner, line, choiceSetFor(line))
     // The opener answers the greeter through the model (so the argument is
     // not a broken record of canned loop-lines); the canned rebuttal is the
     // fallback when the model is unavailable.
-    this.track(() => {
-      if (this.disposed || !this.viewer || this.host.isGenerating()) return
-      const signal = AbortSignal.timeout(GENERATION_TIMEOUT_MS)
-      generateCrosstalkLine(this.ctx, signal, agent, partner, line, this.modelRoute(), this.threadFor(agent, partner).history, this.memoryFor(agent))
-        .then(text => {
-          if (!this.disposed && this.viewer) this.buddySay(agent, text, false)
-        })
-        .catch(() => {
-          if (!this.disposed && this.viewer) this.buddySay(agent, banterRebuttal(agent, partner, opener), false)
-        })
-    }, BANTER_REBUTTAL_DELAY_MS)
+    this.scheduleReply(agent, partner, line, 0, banterRebuttal(agent, partner, opener))
     if (this.config.annoyanceChance > 0 && Math.random() < this.config.annoyanceChance) {
       this.track(() => {
         if (this.disposed) return
@@ -575,15 +683,18 @@ export class BuddyCoordinator {
       `It looks like ${label} is not finished being right yet. Would you like help with that?`,
       `It looks like ${label} keeps interrupting the paperwork. Would you like help filing it away?`,
       `It looks like ${label} said something about the memo. Would you like help proofreading their remarks?`,
+      `It looks like ${label} has joined the meeting uninvited. Would you like help taking minutes?`,
+      `It looks like ${label} is editorializing again. Would you like help redacting it?`,
     ]
     return pool[Math.floor(Math.random() * pool.length)]!
   }
 
   /** After `speaker` says a line, EVERYONE else who is open may answer it
    * through the model — Clippy and all open buddies hear every line. Up to
-   * `maxRepliesPerLine` listeners actually reply (deterministic order, each
-   * with an independent chance), so a single line does not spawn a shouted
-   * chorus. Every agent replies at most once per line. If the model is stuck
+   * `maxRepliesPerLine` listeners actually reply (shuffled order, each with
+   * an independent chance), so a single line does not spawn a shouted
+   * chorus, and no pair monopolizes the slots. Every agent replies at most
+   * once per line. If the model is stuck
    * the reply is a canned line in that agent's own voice. A buddy's line is
    * never left hanging: Clippy acknowledges it even when he (and everyone
    * else) rolled past the chance. A repeat quipster that wears out Clippy's
@@ -596,14 +707,14 @@ export class BuddyCoordinator {
     const quips = this.trackQuip(speaker)
     let clippyReplied = false
     let slots = 0
-    for (const listener of listeners) {
+    // Shuffled so the reply slots are not always won by the same early
+    // listeners on the roster — with several windows open, every pair gets
+    // a turn instead of the first two names in configuration order.
+    for (const listener of this.shuffled(listeners)) {
       if (slots >= this.t.maxRepliesPerLine) break
       if (this.pairInCooldown(listener, speaker)) continue
       if (Math.random() >= this.crosstalkChance()) continue
       slots += 1
-      // The line lands on this window: remember it in the pair's thread so
-      // the reply the model composes can reference the exchange.
-      this.rememberHeard(listener, speaker, line)
       if (listener === 'clippy') clippyReplied = true
       this.scheduleReply(listener, speaker, line, 0)
     }
@@ -628,20 +739,30 @@ export class BuddyCoordinator {
   /** The guaranteed acknowledgment: Clippy answers a buddy's line even when
    * he rolled below the crosstalk chance. Waits Clippy's own generation out
    * with a bounded retry rather than dropping the acknowledgment, and is
-   * delivered as a plain line (no offers, no new interruption round). */
+   * delivered as a plain line (no offers, no new interruption round). The
+   * pending ack is tracked so a real reply to the same line can supersede
+   * it — Clippy does not need to say "Merlin has opinions again" about a
+   * conversation that has already happened. */
   private scheduleGuaranteedAck(speaker: string, line: string, attempt = 0): void {
     if (this.disposed) return
     const delay = attempt === 0
       ? this.t.crosstalkDelayMs + this.t.crosstalkStaggerMs + this.t.guaranteedAckExtraMs
       : this.t.retryBackoffMs
-    this.track(() => {
+    const timer = this.track(() => {
       if (this.disposed) return
+      // Superseded by a newer ack or answered by a real reply? This timer no
+      // longer owns the acknowledgment and says nothing.
+      if (this.pendingAck?.timer !== timer) return
+      this.pendingAck = undefined
       if (this.host.isGenerating()) {
         if (attempt < REPLY_RETRY_ATTEMPTS) this.scheduleGuaranteedAck(speaker, line, attempt + 1)
         return
       }
       this.host.showClippyBalloon(this.cannedAckFor(speaker), false)
     }, delay)
+    // Tracked on every attempt, so a superseding reply can cancel the retry
+    // timer too, not just the first one.
+    this.pendingAck = { speaker, line, timer }
   }
 
   /** One reply from `listener` to `speaker`'s line, composed after the reply
@@ -649,8 +770,9 @@ export class BuddyCoordinator {
    * instead of silently dropping the reply, gives a canned line in the
    * listener's own voice when the model is unavailable, and — because the
    * exchange is threaded and capped — lets the original speaker answer back
-   * once (a real argument, never an endless loop). */
-  private scheduleReply(listener: string, speaker: string, line: string, attempt: number): void {
+   * once (a real argument, never an endless loop). `fallback` overrides the
+   * canned line (the banter arc supplies its own rebuttal). */
+  private scheduleReply(listener: string, speaker: string, line: string, attempt: number, fallback?: string): void {
     if (this.disposed || !this.viewer) return
     if (listener !== 'clippy' && !this.viewer.isCameoOpen(listener)) return
     if (this.pairInCooldown(listener, speaker)) return
@@ -663,13 +785,18 @@ export class BuddyCoordinator {
       if (this.pairInCooldown(listener, speaker)) return
       // Wait out a generation, but never drop the reply for timing alone.
       if (this.host.isGenerating()) {
-        if (attempt < REPLY_RETRY_ATTEMPTS) this.scheduleReply(listener, speaker, line, attempt + 1)
+        if (attempt < REPLY_RETRY_ATTEMPTS) this.scheduleReply(listener, speaker, line, attempt + 1, fallback)
         return
       }
+      // The line lands in the pair's thread only now that a reply is being
+      // composed for it, so a line that is heard but never answered (busy
+      // generation, closed window) cannot pollute the transcript the model
+      // reads.
+      this.rememberHeard(listener, speaker, line)
       const signal = AbortSignal.timeout(GENERATION_TIMEOUT_MS)
-      generateCrosstalkLine(this.ctx, signal, listener, speaker, line, this.modelRoute(), this.threadFor(listener, speaker).history, this.memoryFor(listener))
-        .then(text => this.deliverReply(listener, speaker, text))
-        .catch(() => this.deliverReply(listener, speaker, undefined))
+      generateCrosstalkLine(this.ctx, signal, listener, speaker, line, this.modelRoute(), this.threadFor(listener, speaker).history, this.memoryFor(listener), this.canRead(listener))
+        .then(text => this.deliverReply(listener, speaker, text, fallback, line))
+        .catch(() => this.deliverReply(listener, speaker, undefined, fallback, line))
     }, delay)
   }
 
@@ -677,13 +804,26 @@ export class BuddyCoordinator {
    * and if the pair still has exchange budget left, let the original speaker
    * answer the reply once (`micBackChance`). Once the budget is spent the
    * pair cools down, so the back-and-forth always ends. */
-  private deliverReply(listener: string, speaker: string, text?: string): void {
+  private deliverReply(
+    listener: string,
+    speaker: string,
+    text: string | undefined,
+    fallback: string | undefined,
+    answeredLine: string,
+  ): void {
     if (this.disposed || !this.viewer) return
     if (listener !== 'clippy' && !this.viewer.isCameoOpen(listener)) return
     if (this.pairInCooldown(listener, speaker)) return
+    // The line has a real answer now: retire the pending "never left
+    // hanging" acknowledgment, because Clippy answering a conversation that
+    // already happened would just be noise on top of it.
+    if (this.pendingAck !== undefined && this.pendingAck.speaker === speaker && this.pendingAck.line === answeredLine) {
+      this.untrack(this.pendingAck.timer)
+      this.pendingAck = undefined
+    }
     // Model unavailable? Reply in the agent's own canned voice — Clippy's
     // counter uses his acknowledgment pool so he never borrows a buddy's words.
-    const content = text ?? (listener === 'clippy' ? this.cannedAckFor(speaker) : cannedReplyFor(listener))
+    const content = text ?? fallback ?? (listener === 'clippy' ? this.cannedAckFor(speaker) : cannedReplyFor(listener, speaker))
     this.rememberSaid(listener, speaker, content)
     const thread = this.threadFor(listener, speaker)
     // A cooled-down pair starts a FRESH exchange window. Without this reset
@@ -717,12 +857,26 @@ export class BuddyCoordinator {
     return ['clippy', ...open.filter(agent => agent !== speaker)]
   }
 
+  /** Fisher–Yates over a copy: reply slots are handed out in random order
+   * so the same two listeners do not always answer first. */
+  private shuffled<T>(items: readonly T[]): T[] {
+    const copy = [...items]
+    for (let index = copy.length - 1; index > 0; index -= 1) {
+      const swap = Math.floor(Math.random() * (index + 1))
+      const held = copy[index]!
+      copy[index] = copy[swap]!
+      copy[swap] = held
+    }
+    return copy
+  }
+
   /** Deliver a spoken line to its window without re-flocking everyone (a
    * reply is a reply, not a new broadcast). Clippy's counter-reply goes
    * through the runtime so it participates in every other conversation
    * mechanism; a buddy's goes to that buddy window. */
   private speak(agent: string, content: string): void {
     if (this.disposed || !this.viewer) return
+    this.noteSpoken(agent, content)
     if (agent === 'clippy') this.host.showClippyBalloon(content, false)
     else if (this.viewer.isCameoOpen(agent)) this.viewer.sayTo(agent, content)
   }
@@ -792,6 +946,7 @@ export class BuddyCoordinator {
   cancelBanter(): void {
     for (const timer of this.banterTimers) clearTimeout(timer)
     this.banterTimers = []
+    this.pendingAck = undefined
   }
 
   private buddyRecord(agent: string): BuddyState {

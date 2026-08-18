@@ -16,7 +16,8 @@ function check(name: string, ok: boolean, detail = ''): void {
   results.push(`${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ` (${detail})` : ''}`)
 }
 
-/** Collect SSE `clippy` events until `count` arrive. */
+/** Collect SSE `clippy` events until `count` arrive (or a 10s watchdog
+ * resolves with whatever arrived, so a regression cannot hang the suite). */
 function collectSse(url: string, count: number): { ready: Promise<void>; done: Promise<string[]> } {
   const events: string[] = []
   let resolveReady: () => void = () => {}
@@ -24,8 +25,17 @@ function collectSse(url: string, count: number): { ready: Promise<void>; done: P
     resolveReady = resolve
   })
   const done = new Promise<string[]>((resolve, reject) => {
+    let finished = false
+    const finish = (): void => {
+      if (finished) return
+      finished = true
+      req.destroy()
+      resolve(events)
+    }
+    const watchdog = setTimeout(finish, 10_000)
     const req = get(url, res => {
       if (res.statusCode !== 200) {
+        clearTimeout(watchdog)
         reject(new Error(`SSE status ${res.statusCode}`))
         return
       }
@@ -42,8 +52,8 @@ function collectSse(url: string, count: number): { ready: Promise<void>; done: P
           if (line !== undefined) {
             events.push(line.slice(6))
             if (events.length >= count) {
-              res.destroy()
-              resolve(events)
+              clearTimeout(watchdog)
+              finish()
               return
             }
           }
@@ -104,8 +114,11 @@ async function main(): Promise<void> {
 
   runtime.dispose()
 
-  // --- Choice answers become real user messages (sendUserMessage wiring) ---
+  // --- Choice answers: the button decides what the model does --------------
   // cameoChance: 0 so balloon side effects can never spawn a real window.
+  // A "Yes" no longer writes into the pi session: Clippy carries the offer
+  // out himself with his file powers (the model is absent in tests, so the
+  // fallback balloon is what lands). Refusals and snoozes are unchanged.
   interface InsertRecord { text: string; options?: { deliverAs?: string } }
   const inserted: InsertRecord[] = []
   const choiceCtx = fakeCtx()
@@ -118,21 +131,30 @@ async function main(): Promise<void> {
   const showBalloon = (choiceRun as unknown as {
     showBalloon: (text: string, choices?: boolean | readonly string[]) => void
   }).showBalloon.bind(choiceRun)
+  const balloonEvents: string[] = []
+  const accepted = collectSse(`${viewer.origin}/events?t=${token}`, 4)
+  await accepted.ready
   showBalloon('It looks like you are preparing a memo. Would you like help with it?', ['Yes, please', 'No thanks'])
   choiceRun.onChoice(0)
-  check('accepted answer inserts a real request built from the balloon',
-    inserted.length === 1 && inserted[0]?.text === 'Yes, please — help me with preparing a memo.',
-    inserted.map(r => r.text).join('|'))
-  check('idle insertion sends immediately (no deliverAs)', inserted[0]?.options === undefined)
+  const acceptedEvents = await accepted.done
+  acceptedEvents.forEach(raw => {
+    const parsed = JSON.parse(raw) as { type?: string; text?: string }
+    if (parsed.type === 'balloon' && typeof parsed.text === 'string') balloonEvents.push(parsed.text)
+  })
+  check('accepted answer writes nothing into the session (Clippy does it himself)',
+    inserted.length === 0, inserted.map(r => r.text).join('|'))
+  check('accepted answer makes Clippy act (offer-action balloon lands)',
+    balloonEvents.length >= 1 && balloonEvents.some(t => /on it|filing cabinet/iu.test(t)), balloonEvents.join(' | '))
   showBalloon('It looks like you are addressing an envelope. Would you like help with it?', ['Yes', 'No, not now'])
   choiceRun.onChoice(1)
-  check('refused answer is not inserted', inserted.length === 1, inserted.map(r => r.text).join('|'))
+  check('refused answer is not inserted', inserted.length === 0, inserted.map(r => r.text).join('|'))
   showBalloon('It looks like you are filing papers. Would you like help with it?', ['Yes', 'No', "Don't show this tip again"])
   choiceRun.onChoice(2)
-  check('snooze answer is not inserted', inserted.length === 1, inserted.map(r => r.text).join('|'))
+  check('snooze answer is not inserted', inserted.length === 0, inserted.map(r => r.text).join('|'))
   choiceRun.dispose()
 
-  // While the agent is mid-run the answer is queued as a follow-up.
+  // A buddy's accept still asks the pi session for real (buddies cannot edit
+  // files): the request is queued as a follow-up while the agent is busy.
   const busyCtx = { ...fakeCtx(), isIdle: () => false } as ExtensionContext
   const busyRun = new ClippyRuntime(busyCtx, {
     renderer: 'external',
@@ -140,14 +162,17 @@ async function main(): Promise<void> {
     config: { ...defaultClippyConfig(), cameoChance: 0 },
     sendUserMessage: (text, options) => { inserted.push({ text: String(text), options }) },
   })
-  const showBusy = (busyRun as unknown as {
-    showBalloon: (text: string, choices?: boolean | readonly string[]) => void
-  }).showBalloon.bind(busyRun)
-  showBusy('It looks like you are binding a report. Would you like help with it?', ['Please do', 'Not now'])
-  busyRun.onChoice(0)
-  check('mid-run insertion queues as a follow-up', inserted.length === 2 && inserted[1]?.options?.deliverAs === 'followUp', JSON.stringify(inserted[1] ?? null))
+  viewer.showCameo('bonzi', 'It looks like you are being followed by a paperclip. Would you like help with it?', true)
+  // Deliver the line so the buddy's "last words" exist (the window itself
+  // is stubbed away in tests, so sayTo stands in for the cameo-ready handoff).
+  viewer.sayTo('bonzi', 'It looks like you are being followed by a paperclip. Would you like help with it?')
+  busyRun.onBuddyChoice('bonzi', 0, 'Yes')
+  check('buddy accept still inserts a real request built from the balloon',
+    inserted.length === 1 && (inserted[0]?.text ?? '').startsWith('Yes — help me with'),
+    inserted.map(r => r.text).join('|'))
+  check('mid-run buddy insertion queues as a follow-up',
+    inserted[0]?.options?.deliverAs === 'followUp', JSON.stringify(inserted[0] ?? null))
   busyRun.dispose()
-
   viewer.dispose()
 
   const failed = results.filter(r => r.startsWith('FAIL'))

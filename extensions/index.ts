@@ -32,7 +32,7 @@ export default function (pi: ExtensionAPI) {
   let viewer: ClippyViewer | undefined
 
   pi.registerCommand('clippy', {
-    description: 'Ask Clippy what it looks like you are doing (party and stats subcommands)',
+    description: 'Ask Clippy a question; open buddies can respond (party and stats subcommands)',
     handler: async (args, ctx) => {
       if (runtime === undefined) {
         ctx.ui.notify('Clippy is not watching this session', 'error')
@@ -50,7 +50,7 @@ export default function (pi: ExtensionAPI) {
       } else if (command === 'roast') {
         await runtime.triggerRoast()
       } else {
-        await runtime.triggerBalloon(true)
+        await runtime.triggerUserMessage(args)
       }
     },
   })

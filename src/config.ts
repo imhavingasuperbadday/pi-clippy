@@ -13,6 +13,9 @@
  *       "voiceRate": 1,                 // speech rate (0.5 - 2)
  *       "voicePitch": 1,                // speech pitch (0 - 2)
  *       "cameoChance": 0.2,             // chance Clippy's mood makes him send for a rival (0 = no uninvited arrivals)
+ *       "idleThinking": true,            // think in the background while the session is idle, and act on it
+ *       "idleThinkAfterMs": 120000,      // how long the session must be quiet before the first thought
+ *       "idleThinkCooldownMs": 300000,   // minimum quiet time between one thought and the next
  *       "profanity": true,              // let Clippy swear on the rare lines where he is genuinely furious
  *       "crosstalkChance": 0.65,        // per-line chance an open buddy/Clippy replies (0 = off)
  *       "cameos": ["bonzi","genie","merlin","rover","rocky","peedy","links"],
@@ -52,6 +55,17 @@ export interface ClippyConfig {
    * summon, a buddy dragging in its partner, or the user). 0 means Clippy
    * never sends for anyone and only the user can open a buddy window. */
   readonly cameoChance: number
+  /** Whether Clippy thinks quietly in the background while the session is
+   * idle and, when he feels like it, acts on his own — starting a chat with
+   * a buddy, offering help, or musing out loud. Thoughts never edit files;
+   * a file edit still needs a pressed Yes. Chat impulses respect cameoChance
+   * (0 = he never calls anyone, even when he wants to). */
+  readonly idleThinking: boolean
+  /** How long the session must be quiet before Clippy's first background
+   * thought (ms). */
+  readonly idleThinkAfterMs: number
+  /** Minimum quiet time between one background thought and the next (ms). */
+  readonly idleThinkCooldownMs: number
   /** Whether Clippy may swear on the rare lines where he is genuinely
    * furious (see src/temper.ts). Off makes him permanently polite. */
   readonly profanity: boolean
@@ -80,6 +94,9 @@ export function defaultClippyConfig(): ClippyConfig {
     autoOpen: true,
     voice: VOICE_OFF,
     cameoChance: 0.2,
+    idleThinking: true,
+    idleThinkAfterMs: 120_000,
+    idleThinkCooldownMs: 300_000,
     profanity: true,
     crosstalkChance: 0.65,
     cameos: [...CAMEO_AGENTS],
@@ -136,6 +153,9 @@ export function readClippyConfig(): ClippyConfig {
         pitch: clampSetting(record, 'voicePitch', 1, 0, 2),
       },
       cameoChance: clampSetting(record, 'cameoChance', 0.2, 0, 1),
+      idleThinking: record.idleThinking !== false,
+      idleThinkAfterMs: clampSetting(record, 'idleThinkAfterMs', 120_000, 30_000, 900_000),
+      idleThinkCooldownMs: clampSetting(record, 'idleThinkCooldownMs', 300_000, 60_000, 3_600_000),
       profanity: record.profanity !== false,
       crosstalkChance: clampSetting(record, 'crosstalkChance', 0.65, 0, 1),
       cameos: cameos.length > 0 ? cameos : fallback.cameos,

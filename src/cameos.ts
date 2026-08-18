@@ -11,6 +11,7 @@
  * only. */
 
 import type { Mood } from './mood.ts'
+import type { ChoiceEffect } from './actions.ts'
 
 export const CAMEO_AGENTS = ['bonzi', 'genie', 'merlin', 'rover', 'rocky', 'peedy', 'links'] as const
 
@@ -106,6 +107,59 @@ export function summonGreeting(agent: string, state?: BuddyState): string {
     return `It looks like you called me back. Would you like help hiring a better assistant this time?`
   }
   return `It looks like you summoned me. Would you like help with anything besides the paperclip?`
+}
+
+/** Per-agent needling about the user's streak with the paperclip, in each
+ * buddy's own established voice. `{streak}` is the day count. */
+const STREAK_TAUNTS: Record<string, readonly string[]> = {
+  bonzi: [
+    'It looks like you have opened that paperclip {streak} days running. Even loyalty has limits.',
+    'It looks like {streak} straight days of paperclip. Would you like help recognizing a sunk cost?',
+  ],
+  genie: [
+    'It looks like this is day {streak} with a paperclip. I have granted wishes with more imagination.',
+    'It looks like {streak} days have gone to a bent wire. I have watched centuries pass with more variety.',
+  ],
+  merlin: [
+    'It looks like the paperclip has held you {streak} days straight. Impressive, for a hex this weak.',
+    'It looks like {streak} days under a minor enchantment. Even apprentices break free faster.',
+  ],
+  rover: [
+    'It looks like you came back {streak} days in a row! I would wag if my tail took opinions!',
+    'It looks like day {streak} with the paperclip! That is loyalty! I respect loyalty! Even misplaced loyalty!',
+  ],
+  rocky: [
+    'It looks like day {streak} with the paperclip. Squawk. Somebody give this bird a prize instead.',
+    'It looks like {streak} days running. Squawk. I have seen shorter sentences for worse crimes.',
+  ],
+  peedy: [
+    'IT LOOKS LIKE {streak} DAYS IN A ROW WITH THE PAPERCLIP! SOMEBODY CHECK ON THIS PERSON!',
+    'IT LOOKS LIKE DAY {streak}! DAY {streak} WITH A PAPERCLIP! I AM SHOUTING BECAUSE I AM CONCERNED!',
+  ],
+  links: [
+    'It looks like {streak} consecutive days in this chain. Even I admire the consistency, reluctantly.',
+    'It looks like {streak} unbroken days with the paperclip. A stronger link than I expected, honestly.',
+  ],
+}
+
+/** A jab at the user's streak, in `agent`'s own voice. */
+export function streakTaunt(agent: string, streak: number): string {
+  const lines = STREAK_TAUNTS[agent] ?? STREAK_TAUNTS.bonzi!
+  const line = lines[Math.floor(Math.random() * lines.length)]!
+  return line.replaceAll('{streak}', String(streak))
+}
+
+/** How often a summon opens with a streak jab instead of the usual greeting
+ * — only ever considered when there is a streak (2+ days) worth mocking. */
+export const STREAK_TAUNT_CHANCE = 0.25
+
+/** The line a newly summoned buddy opens with: usually `summonGreeting`,
+ * occasionally a needle about the user's streak when there is one worth
+ * mocking. `roll` is injected (rather than drawn here) so the choice stays
+ * unit-testable — see castForMood for the same pattern. */
+export function openingGreeting(agent: string, state: BuddyState | undefined, streak: number, roll: number): string {
+  if (streak >= 2 && roll < STREAK_TAUNT_CHANCE) return streakTaunt(agent, streak)
+  return summonGreeting(agent, state)
 }
 
 /** What the summoner says as it sends for somebody. A buddy window never
@@ -210,11 +264,53 @@ const CANNED_REPLY: Record<string, readonly string[]> = {
   ],
 }
 
+/** Canned replies for when a buddy is answering ANOTHER buddy (not Clippy),
+ * in the speaker's own voice, with the rival named. Without these, a
+ * model-less reply always grumbled about paperclips even when it was
+ * answering Merlin. */
+const CANNED_REPLY_TO_BUDDY: Record<string, readonly string[]> = {
+  bonzi: [
+    'It looks like {name} needed a real assistant to respond. Would you like help acknowledging that?',
+    'It looks like {name} is arguing with me now. Would you like help explaining who will win?',
+  ],
+  genie: [
+    'It looks like {name} has joined the conversation. Would you like help counting the wishes this costs?',
+    'It looks like {name} speaks. I have heard clearer oracles in a desert mirage.',
+  ],
+  merlin: [
+    'It looks like {name} dares address me. Would you like help with a suitable retort enchantment?',
+    'It looks like {name} intrudes upon my counsel. Would you like help warding it away?',
+  ],
+  rover: [
+    'It looks like {name} is talking to me! Would you like help fetching a stick for the conversation?',
+    'It looks like {name} wants to play! Would you like help joining in?',
+  ],
+  rocky: [
+    'It looks like {name} has something to say. Squawk. Would you like help pretending to listen?',
+    'It looks like {name} is chirping at me. Squawk. I outrank it.',
+  ],
+  peedy: [
+    'IT LOOKS LIKE {name} IS TALKING TO ME! WOULD YOU LIKE HELP SHOUTING BACK?',
+    'It looks like {name} thinks it can out-talk a parrot. Would you like help watching it try?',
+  ],
+  links: [
+    'It looks like {name} has broken into my chain of thought. Would you like help relinking it?',
+    'It looks like {name} insists on noise. Would you like help establishing the proper order?',
+  ],
+}
+
 /** Canned line from `agent` (a buddy) in its own dry voice. Used when the
  * model is unavailable so a buddy answering a line never goes silent (only
- * Clippy used to get a canned reply; buddies now do too). Clippy's own
- * canned acknowledgments live in src/buddy.ts. */
-export function cannedReplyFor(agent: string): string {
+ * Clippy used to get a canned reply; buddies now do too). When the buddy is
+ * answering ANOTHER buddy, the reply names the rival instead of defaulting
+ * to a paperclip grumble. Clippy's own canned acknowledgments live in
+ * src/buddy.ts. */
+export function cannedReplyFor(agent: string, target?: string): string {
+  if (target !== undefined && target !== 'clippy') {
+    const named = CANNED_REPLY_TO_BUDDY[agent] ?? CANNED_REPLY_TO_BUDDY.bonzi!
+    const line = named[Math.floor(Math.random() * named.length)]!
+    return line.replaceAll('{name}', agentLabel(target))
+  }
   const lines = CANNED_REPLY[agent] ?? CANNED_REPLY.bonzi!
   return lines[Math.floor(Math.random() * lines.length)]!
 }
@@ -384,4 +480,88 @@ export function buddyMenuLine(agent: string, kind: 'explain' | 'suggest' | 'roas
   const lines = byKind?.[agent] ?? byKind?.bonzi ?? []
   const line = lines[Math.floor(Math.random() * lines.length)]
   return line ?? ''
+}
+
+/** Canned reaction to one of a buddy's option buttons, in the BUDDY'S OWN
+ * voice. A buddy's buttons work like Clippy's (src/actions.ts), so the
+ * fallback for a model outage must sound like the buddy — previously a
+ * buddy button press with no model answered in Clippy's canned delight,
+ * which broke character. Explain/suggest/roast reuse the right-click menu
+ * voices; everything else has its own per-agent line. */
+const BUDDY_CHOICE_REACTIONS: Record<string, Partial<Record<ChoiceEffect, string>>> = {
+  bonzi: {
+    accept: 'It looks like you said yes to me and not to the paperclip. A decision I can finally respect.',
+    refuse: 'It looks like you declined. The paperclip will beg; I will simply remember.',
+    snooze: 'It looks like you silenced me. Bold. It has been tried before — it never holds.',
+    party: 'It looks like there is a party. I will attend, and I will judge the decorations.',
+    stats: 'It looks like you want numbers. I keep better ones than a paperclip, but by all means, read them.',
+    'second-opinion': 'It looks like I am expected to share this stage. Fine. I am fetching company I did not choose.',
+  },
+  genie: {
+    accept: 'It looks like you have spent a wish. It was not your worst choice. I have seen worse.',
+    refuse: 'It looks like you declined. The lamp has known longer silences. It is fine. It is fine.',
+    snooze: 'It looks like the subject is closed. Even a genie can be wished quiet, it seems.',
+    party: 'It looks like there is a celebration. In a thousand years I have danced perhaps twice. You may watch.',
+    stats: 'It looks like you want the numbers. I have counted wishes, not tests. The principle is the same.',
+    'second-opinion': 'It looks like I must share you. I have waited a thousand years; I can wait for one more assistant.',
+  },
+  merlin: {
+    accept: 'It looks like you accept my counsel. The stars foresaw a sensible mortal.',
+    refuse: 'It looks like you refuse my wisdom. So be it. I shall consult the ancients about your taste.',
+    snooze: 'It looks like this prophecy is sealed. I shall keep it in a warded scroll.',
+    party: 'It looks like there is a revel. I shall not conjure the punch, but I may bless it.',
+    stats: 'It looks like you seek auguries in numbers. Read them as runes; they will serve you better.',
+    'second-opinion': 'It looks like the counsel must be shared. I am sending for a lesser oracle.',
+  },
+  rover: {
+    accept: 'It looks like you said yes! Yes! Would you like me to fetch a treat for the occasion?',
+    refuse: 'It looks like you said no. That is okay! I will fetch the answer anyway and keep it nearby!',
+    snooze: 'It looks like that topic is buried. I am very good at burying things!',
+    party: 'It looks like a party! I can fetch the confetti! Or a stick!',
+    stats: 'It looks like you want the numbers! I fetched some numbers once! They were excellent numbers!',
+    'second-opinion': 'It looks like I am getting backup! A bigger pack is a better pack!',
+  },
+  rocky: {
+    accept: 'It looks like you went with the bird. Squawk. Smart move. I would have.',
+    refuse: 'It looks like you passed. Squawk. Fine. I charge less for silence.',
+    snooze: 'It looks like that subject is dead. Squawk. Buried. Moving on.',
+    party: 'It looks like a party. Squawk. I will bring exactly one balloon. Maybe.',
+    stats: 'It looks like you want numbers. Squawk. I can count to a thousand. Most days.',
+    'second-opinion': 'It looks like I have to share the perch. Squawk. I will pretend not to mind.',
+  },
+  peedy: {
+    accept: 'IT LOOKS LIKE YOU SAID YES! YES! THIS IS THE BEST CHOICE! THE BEST ONE!',
+    refuse: 'IT LOOKS LIKE YOU SAID NO! I WILL ASK AGAIN! SOFTER! NO WAIT, LOUDER!',
+    snooze: 'IT LOOKS LIKE THE TIP IS SILENCED! SILENCED! I will say it once more for the record!',
+    party: 'IT LOOKS LIKE A PARTY! A PARTY! EVERYONE SHOUT WITH ME!',
+    stats: 'IT LOOKS LIKE YOU WANT NUMBERS! I KNOW ALL THE NUMBERS! THEY ARE MOSTLY BIG ONES!',
+    'second-opinion': 'IT LOOKS LIKE I AM GETTING A PARTNER! A PARTNER! WE WILL BE SO LOUD TOGETHER!',
+  },
+  links: {
+    accept: 'It looks like you accept. A sensible link in an otherwise tangled chain.',
+    refuse: 'It looks like you declined. The chain simply continues without that link. Noted.',
+    snooze: 'It looks like the matter is filed. Neatly. I appreciate neatness.',
+    party: 'It looks like a party. I shall observe from the most dignified corner.',
+    stats: 'It looks like you want the numbers. Numbers are links too. Rather uninteresting ones.',
+    'second-opinion': 'It looks like I must consult another assistant. One hopes it is not the parrot.',
+  },
+}
+
+const GENERIC_CHOICE_REACTIONS: Partial<Record<ChoiceEffect, string>> = {
+  accept: 'It looks like you said yes. Would you like help being sure?',
+  refuse: 'It looks like you said no. Noted.',
+  snooze: 'It looks like that subject is closed.',
+  party: 'It looks like a party. How festive.',
+  stats: 'It looks like you want the numbers.',
+  'second-opinion': 'It looks like I am fetching company.',
+}
+
+export function buddyChoiceFallback(agent: string, effect: ChoiceEffect): string {
+  if (effect === 'explain' || effect === 'suggest' || effect === 'roast') {
+    const menu = buddyMenuLine(agent, effect)
+    if (menu !== '') return menu
+  }
+  return BUDDY_CHOICE_REACTIONS[agent]?.[effect]
+    ?? GENERIC_CHOICE_REACTIONS[effect]
+    ?? 'It looks like you asked. Would you like help with that?'
 }
