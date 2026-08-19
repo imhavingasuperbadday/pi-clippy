@@ -16,7 +16,9 @@
  *       "idleThinking": true,            // think in the background while the session is idle, and act on it
  *       "idleThinkAfterMs": 120000,      // how long the session must be quiet before the first thought
  *       "idleThinkCooldownMs": 300000,   // minimum quiet time between one thought and the next
+ *       "inputCommentChance": 0.35,      // per-message chance Clippy comments on what you type before it is sent (0 = off)
  *       "profanity": true,              // let Clippy swear on the rare lines where he is genuinely furious
+ *       "rapport": true,                // let the relationship (yeses, pets, snubs) colour his register
  *       "crosstalkChance": 0.65,        // per-line chance an open buddy/Clippy replies (0 = off)
  *       "cameos": ["bonzi","genie","merlin","rover","rocky","peedy","links"],
  *       "cameoHoldMs": 8000,            // how long a cameo window stays before dismissing itself
@@ -26,7 +28,10 @@
  *       "dailyGreeting": true,          // first session of the day gets a stats greeting
  *       "greetingChance": 0.6,          // probability of that greeting
  *       "seasonal": true,               // seasonal/holiday-aware office offers
- *       "hemisphere": "north"           // "north" | "south" (which way the seasons run)
+ *       "hemisphere": "north",          // "north" | "south" (which way the seasons run)
+ *       "deskNotes": true,              // splice Clippy's desk notes into the coding agent's context
+ *       "agentTools": true,             // register ask_clippy / clippy_remember as pi tools
+ *       "destiny": true                 // allow the /clippy destiny background-goal system
  *     }
  *   }
  *
@@ -66,9 +71,21 @@ export interface ClippyConfig {
   readonly idleThinkAfterMs: number
   /** Minimum quiet time between one background thought and the next (ms). */
   readonly idleThinkCooldownMs: number
+  /** Per-message chance that Clippy reads your message before it is sent
+   * and says one short thing about WHAT you typed — advice, a jab, or an
+   * earnest worry. The send itself is never blocked or rewritten; the
+   * comment just lands while the message is already on its way. 0 turns
+   * the pre-send commentary off entirely. */
+  readonly inputCommentChance: number
   /** Whether Clippy may swear on the rare lines where he is genuinely
    * furious (see src/temper.ts). Off makes him permanently polite. */
   readonly profanity: boolean
+  /** Whether the relationship arc (src/rapport.ts) colours how he talks to
+   * you: how forward he is, how familiar he is allowed to be, and whether
+   * a long friendship — or a session spent shutting him up — is felt at all.
+   * Off makes him the same cheerful stranger every session, which is the
+   * pre-rapport behaviour. */
+  readonly rapport: boolean
   /** Per-line chance an open listener actually replies to a line (0 = crosstalk
    * off entirely; the guaranteed acknowledgment still fires for buddies). */
   readonly crosstalkChance: number
@@ -85,6 +102,18 @@ export interface ClippyConfig {
   /** Which hemisphere's seasons apply, so a January session is not offered
    * snowflake letterhead in Melbourne. */
   readonly hemisphere: Hemisphere
+  /** Whether Clippy's running desk notes are spliced into the CODING AGENT'S
+   * context before each model call (src/memo.ts). This is the one channel
+   * where Clippy affects the agent's answers rather than commenting on them. */
+  readonly deskNotes: boolean
+  /** Whether the coding agent gets `ask_clippy` and `clippy_remember` as real
+   * pi tools, so it can consult him and file notes with him mid-turn. */
+  readonly agentTools: boolean
+  /** Whether the background-goal system exists at all (`/clippy destiny`,
+   * src/destiny.ts). Off means the commands report it is disabled and no
+   * background edit can ever be attempted; on still requires an explicit
+   * per-session grant before he touches a file. */
+  readonly destiny: boolean
 }
 
 export function defaultClippyConfig(): ClippyConfig {
@@ -97,7 +126,9 @@ export function defaultClippyConfig(): ClippyConfig {
     idleThinking: true,
     idleThinkAfterMs: 120_000,
     idleThinkCooldownMs: 300_000,
+    inputCommentChance: 0.35,
     profanity: true,
+    rapport: true,
     crosstalkChance: 0.65,
     cameos: [...CAMEO_AGENTS],
     cameoHoldMs: 8_000,
@@ -108,6 +139,9 @@ export function defaultClippyConfig(): ClippyConfig {
     greetingChance: 0.6,
     seasonal: true,
     hemisphere: 'north',
+    deskNotes: true,
+    agentTools: true,
+    destiny: true,
   }
 }
 
@@ -156,7 +190,9 @@ export function readClippyConfig(): ClippyConfig {
       idleThinking: record.idleThinking !== false,
       idleThinkAfterMs: clampSetting(record, 'idleThinkAfterMs', 120_000, 30_000, 900_000),
       idleThinkCooldownMs: clampSetting(record, 'idleThinkCooldownMs', 300_000, 60_000, 3_600_000),
+      inputCommentChance: clampSetting(record, 'inputCommentChance', 0.35, 0, 1),
       profanity: record.profanity !== false,
+      rapport: record.rapport !== false,
       crosstalkChance: clampSetting(record, 'crosstalkChance', 0.65, 0, 1),
       cameos: cameos.length > 0 ? cameos : fallback.cameos,
       cameoHoldMs: clampSetting(record, 'cameoHoldMs', 8_000, 2_000, 60_000),
@@ -167,6 +203,9 @@ export function readClippyConfig(): ClippyConfig {
       greetingChance: clampSetting(record, 'greetingChance', 0.6, 0, 1),
       seasonal: record.seasonal !== false,
       hemisphere: record.hemisphere === 'south' ? 'south' : 'north',
+      deskNotes: record.deskNotes !== false,
+      agentTools: record.agentTools !== false,
+      destiny: record.destiny !== false,
     }
   } catch {
     return fallback

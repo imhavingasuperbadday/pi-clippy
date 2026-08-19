@@ -68,12 +68,26 @@ export class OfferTracker {
      * against you (src/temper.ts); being quietly let go is not. */
     private readonly onUnresolved: (outcome: UnresolvedOfferOutcome, offerText: string, label: string) => void = () => {},
     private readonly random: () => number = Math.random,
+    /** Whether Clippy is allowed to take THIS silence as a yes. He decides
+     * plenty of things for you, but an offer whose yes would put a message
+     * into your own pi session is never one of them — that button has to be
+     * pressed by a person. False makes the accept roll fall through to him
+     * deciding against it himself, or to the quiet drop. */
+    private readonly mayDecideForYou: () => boolean = () => true,
   ) {}
 
   /** A balloon (with or without buttons) just went up: track its subject and
-   * start watching for silence so an unanswered offer can be called out. */
+   * start watching for silence so an unanswered offer can be called out.
+   *
+   * Buttons do not always mean an offer. A game throw, a page of the book,
+   * a dialog of his own — those carry buttons that are not a yes/no about
+   * work, and nagging someone for not finishing a page they were reading is
+   * the bad version of this character. Passing an EMPTY offerSubject says
+   * so outright: this balloon has buttons and no offer behind them. */
   onBalloonShown(text: string, choices: readonly string[] | undefined, offerSubject?: string): void {
-    const subject = choices === undefined ? undefined : (offerSubject ?? offerSubjectOf(text))
+    const subject = choices === undefined || offerSubject === ''
+      ? undefined
+      : (offerSubject ?? offerSubjectOf(text))
     this.lastOfferSubject = subject
     this.lastOfferText = subject === undefined ? undefined : text
     this.lastOfferChoices = subject === undefined ? undefined : choices
@@ -138,7 +152,7 @@ export class OfferTracker {
       if (!this.isAlive() || this.offerAnswered || this.lastOfferSubject === undefined || offerText === undefined) return
       const clean = subjectOf(subject)
       const roll = this.random()
-      if (roll < UNRESOLVED_ACCEPT_CHANCE) {
+      if (roll < UNRESOLVED_ACCEPT_CHANCE && this.mayDecideForYou()) {
         // Silence taken as a yes, for real: the runtime carries this out
         // with the same powers a pressed Yes would get.
         const acceptLabel = choices?.find(label => !REFUSAL_LABEL.test(label)) ?? 'Yes'
@@ -172,6 +186,20 @@ export class OfferTracker {
 
   dispose(): void {
     this.clearTimers()
+    this.snoozedTopics.clear()
+  }
+
+  /** A lobotomy (src/runtime.ts lobotomize): the whole offer history is
+   * dropped — nag and silence-watch timers, the current offer, snoozed
+   * topics, and the running refusal count — so the next balloon offers
+   * like the very first one. */
+  reset(): void {
+    this.clearTimers()
+    this.lastOfferSubject = undefined
+    this.lastOfferText = undefined
+    this.lastOfferChoices = undefined
+    this.offerAnswered = true
+    this.refusals = 0
     this.snoozedTopics.clear()
   }
 }

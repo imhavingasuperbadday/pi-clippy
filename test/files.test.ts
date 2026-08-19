@@ -77,6 +77,39 @@ check('edit_file succeeds through the choke point', edit.ok === true && edit.act
 const escape = executeFileTool(project, 'read_file', { path: '../outside/loot.txt' })
 check('the choke point blocks escapes', escape.ok === false)
 
+// --- The background goal's edit scope ----------------------------------------
+//
+// The second, independent fence: containment in the project is checked first
+// and always, and the scope narrows it further for unsupervised goal work.
+
+mkdirSync(join(root, 'inscope'), { recursive: true })
+mkdirSync(join(root, 'outofscope'), { recursive: true })
+writeFileSync(join(root, 'inscope', 'a.txt'), 'hello there\n', 'utf8')
+writeFileSync(join(root, 'outofscope', 'b.txt'), 'hello there\n', 'utf8')
+writeFileSync(join(root, 'inscopefile.txt'), 'hello there\n', 'utf8')
+
+check('an in-scope edit goes through',
+  editProjectFile(root, 'inscope/a.txt', 'hello', 'goodbye', ['inscope']).created === false)
+check('an out-of-scope edit is refused',
+  throws(() => editProjectFile(root, 'outofscope/b.txt', 'hello', 'goodbye', ['inscope']),
+    'outside what I am allowed') !== undefined)
+check('a scoped file itself may be edited',
+  editProjectFile(root, 'inscopefile.txt', 'hello', 'goodbye', ['inscopefile.txt']).created === false)
+check('a name that merely starts the same is out of scope',
+  throws(() => editProjectFile(root, 'outofscope/b.txt', 'hello', 'goodbye', ['out']),
+    'outside what I am allowed') !== undefined)
+check('a scope cannot be escaped with ..',
+  throws(() => editProjectFile(root, 'inscope/../outofscope/b.txt', 'hello', 'goodbye', ['inscope']),
+    'outside what I am allowed') !== undefined)
+check('no scope means no extra narrowing (the ordinary accepted-offer path)',
+  editProjectFile(root, 'outofscope/b.txt', 'hello', 'goodbye').created === false)
+const scopedTool = executeFileTool(root, 'edit_file',
+  { path: 'outofscope/b.txt', oldText: 'goodbye', newText: 'hello' }, ['inscope'])
+check('the tool choke point enforces the scope too',
+  !scopedTool.ok && scopedTool.text.includes('outside what I am allowed'))
+check('a refused scoped edit changes nothing on disk',
+  readFileSync(join(root, 'outofscope', 'b.txt'), 'utf8').startsWith('goodbye'))
+
 // --- The permission dance ----------------------------------------------------
 check('a buddy asking to read files is detected',
   buddyRequestsFileAccess('Clippy, let me read the project files and I will show you the bug.')

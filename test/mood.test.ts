@@ -14,7 +14,10 @@ import type { ClippyEvidence, ClippyToolEvidence } from '../src/context.ts'
 import { castForMood, environmentLine } from '../src/cameos.ts'
 import {
   climateBriefing,
+  climateTrend,
   errorSignature,
+  moodIntensity,
+  moodRing,
   isRemarkable,
   moodDirective,
   MOODS,
@@ -160,6 +163,62 @@ check('every agent has a line for every mood',
 check('an unknown agent still gets a line', environmentLine('nobody', 'proud').length > 5)
 check('agents differ on the moods they care about',
   environmentLine('rocky', 'snippy') !== environmentLine('peedy', 'snippy'))
+
+// --- Intensity: the mood has a volume as well as a name -------------------
+
+const twoFailures = sessionClimate(evidence({ recentTools: [tool({ outcome: 'error' }), tool({ outcome: 'error' })] }))
+const manyFailures = sessionClimate(evidence({
+  recentTools: Array.from({ length: 9 }, () => tool({ outcome: 'error' })),
+}))
+check('a worse room is felt harder in the same mood family',
+  manyFailures.intensity > twoFailures.intensity,
+  `${twoFailures.mood}:${twoFailures.intensity} vs ${manyFailures.mood}:${manyFailures.intensity}`)
+check('intensity always lands in [0, 1]',
+  MOODS.every(mood => [0, 3, 9].every(n => {
+    const value = moodIntensity(mood, { errorStreak: n, repeatCount: n, activityMinutes: n * 40, tests: undefined })
+    return value >= 0 && value <= 1
+  })))
+check('the directive says so when the feeling is at its strongest',
+  moodDirective({ ...manyFailures, intensity: 1 }).includes('strongest'))
+check('and says so when it is faint',
+  moodDirective({ ...twoFailures, mood: 'concerned', intensity: 0.3 }).includes('understate'))
+check('a calm mood is never given an intensity instruction',
+  !moodDirective(sessionClimate(evidence())).includes('strongest'))
+
+// --- The ring carries the volume ------------------------------------------
+
+check('a calm ring is drawn exactly as it always was',
+  moodRing('delighted', 1).width === 2 && moodRing('delighted', 1).glow === 0)
+check('a bad room draws a heavier ring',
+  moodRing('furious', 1).width > moodRing('furious', 0).width)
+check('the halo scales with the feeling and never inverts',
+  moodRing('concerned', 1).glow > moodRing('concerned', 0.2).glow && moodRing('concerned', 0).glow === 0)
+check('a nonsense intensity still produces a drawable ring',
+  moodRing('snippy', Number.NaN).width >= 2)
+
+// --- Trend: which way the room is going -----------------------------------
+
+check('too little evidence is never a trend', climateTrend(evidence({ recentTools: [tool({ outcome: 'error' })] })) === 'steady')
+check('a session coming apart reads as worsening',
+  climateTrend(evidence({
+    recentTools: [tool(), tool(), tool({ outcome: 'error' }), tool({ outcome: 'error' })],
+  })) === 'worsening')
+check('a session pulling out of it reads as improving',
+  climateTrend(evidence({
+    recentTools: [tool({ outcome: 'error' }), tool({ outcome: 'error' }), tool(), tool()],
+  })) === 'improving')
+check('one flaky call in a good run is not a collapse',
+  climateTrend(evidence({
+    recentTools: [tool(), tool(), tool(), tool(), tool(), tool(), tool(), tool({ outcome: 'error' })],
+  })) === 'steady')
+check('unfinished calls are not evidence of anything',
+  climateTrend(evidence({
+    recentTools: [tool(), tool(), tool({ outcome: 'running' }), tool({ outcome: 'running' })],
+  })) === 'steady')
+check('the buddies are told which way it is going',
+  climateBriefing(sessionClimate(evidence({
+    recentTools: [tool({ outcome: 'error' }), tool({ outcome: 'error' }), tool(), tool()],
+  }))).includes('getting better'))
 
 const failed = results.filter(r => r.startsWith('FAIL'))
 console.log(results.join('\n'))

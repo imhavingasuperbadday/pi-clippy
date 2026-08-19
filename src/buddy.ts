@@ -45,6 +45,7 @@ import {
   environmentLine,
   openingGreeting,
   summonAnnouncement,
+  topicOf,
   turnOffLine,
   userTalkLine,
   type BuddyState,
@@ -60,6 +61,7 @@ import {
   type ChoiceEffect,
 } from './actions.ts'
 import {
+  generateBoardLine,
   generateChoiceReplyLine,
   generateCrosstalkLine,
   generateOpeningLine,
@@ -69,15 +71,24 @@ import {
 } from './generator.ts'
 import { isRemarkable, type SessionClimate } from './mood.ts'
 import { asksForHelp } from './response.ts'
+import { flavorize } from './flavor.ts'
+import { shushedLine } from './shush.ts'
 import { buddyRequestsFileAccess, clippyGrantsFileAccess } from './permission.ts'
 import { NO_FILE_POWERS, READ_ONLY, type FilePowers } from './files.ts'
 import type { ClippyViewer } from './viewer.ts'
 
 const GENERATION_TIMEOUT_MS = 90_000
+/** Canned buddy lines get the same spoken variety as Clippy's own: a varied
+ * opener, and a chance to end as a plain remark with no question at all. */
+const FLAVOR = { dropQuestionChance: 0.4 } as const
 /** Buddy opening lines are generated against Clippy's last words, but a
  * waiting window must not stare at a blank screen forever: cap the model at
  * 8s and fall back to the canned greeting. */
 const OPENING_TIMEOUT_MS = 8_000
+/** A second opinion the user pressed a button for is worth a longer wait than
+ * a drive-by quip: it has to actually read the room (and sometimes a file)
+ * before it says anything. */
+const SECOND_OPINION_TIMEOUT_MS = 20_000
 /** Cameo banter: a buddy may conjure a partner to argue with. */
 const BANTER_REBUTTAL_DELAY_MS = 8_000
 /** Annoyance arc: Clippy may tire of a repeat interrupter and turn it off. */
@@ -104,6 +115,18 @@ const ENVIRONMENT_REACTION_COOLDOWN_MS = 120_000
 /** File access: Clippy reads on his own; a buddy reads only after Clippy
  * granted it (rarely, and only after being convinced). */
 const MAX_READ_GRANTS_PER_SESSION = 2
+/** How many recently summoned buddies are held out of the next casting draw.
+ * Three is enough to break the "the same rival every single time" pattern
+ * without making the roster feel like a rota. */
+const RECENT_SUMMON_MEMORY = 3
+/** How many assistants sit on the board. Three is a committee; four is a
+ * queue of windows nobody asked for. */
+const BOARD_MEETING_SIZE = 3
+/** The chair's canned lines: the call to order, the line for a meeting
+ * nobody could be got to, and the recommendation of last resort. */
+const BOARD_MEETING_OPENING = 'I am convening a meeting. Everyone will propose one next step and nobody will interrupt, including me.'
+const BOARD_MEETING_QUORUM = 'Nobody came. I have taken the minutes anyway, and the minutes say you should keep going.'
+const BOARD_MEETING_FALLBACK = 'The committee could not agree. As chair I am recommending we do the small careful thing first. Would you like help with it?'
 /** Crosstalk volume scaling by mood. When the session is going badly the
  * user does not want three windows arguing over the wreckage — the buddies
  * still *react to the event* (that is on-topic and short), they just stop
@@ -144,6 +167,8 @@ export interface BuddyTimings {
   /** How long the guaranteed "never left hanging" acknowledgment waits after
    * the chance replies would have landed. */
   guaranteedAckExtraMs: number
+  /** The beat between one board-meeting proposal and the next. */
+  boardBeatMs: number
 }
 
 export const DEFAULT_BUDDY_TIMINGS: BuddyTimings = {
@@ -156,6 +181,7 @@ export const DEFAULT_BUDDY_TIMINGS: BuddyTimings = {
   maxExchangesPerWindow: 2,
   micBackChance: 0.5,
   guaranteedAckExtraMs: 1_000,
+  boardBeatMs: 4_000,
 }
 
 /** Session-scoped memory of one pair's conversation: the rolling transcript
@@ -193,6 +219,13 @@ export interface BuddyHost {
   /** Effects that belong to the desktop rather than to one character
    * (the party parade, reading the stats out). */
   readonly runHostEffect: (effect: ChoiceEffect) => void
+  /** Has this agent been told to shut up? A shushed agent produces no
+   * speech of any kind and takes no reply slots on the floor (see
+   * src/shush.ts). Absent means nobody is ever silenced. */
+  readonly isShushed?: (agent: string) => boolean
+  /** File something a shushed agent would have reacted to, so it has one
+   * thing to say when it is allowed to talk again. */
+  readonly noteMissed?: (agent: string, event: string) => void
 }
 
 export class BuddyCoordinator {
@@ -225,6 +258,9 @@ export class BuddyCoordinator {
   private readonly pendingReadRequests = new Map<string, string>()
   /** Grants Clippy has issued this session (the hard cap on generosity). */
   private readGrantsIssued = 0
+  /** Who has been sent for lately (most recent last), so casting rotates
+   * through the roster instead of drawing the same rival all afternoon. */
+  private readonly recentSummons: string[] = []
   /** Effective messaging timeline (defaults overlaid with any override). */
   private readonly t: BuddyTimings
 
@@ -272,6 +308,25 @@ export class BuddyCoordinator {
     this.pendingReadRequests.clear()
   }
 
+  /** A lobotomy (src/runtime.ts lobotomize): everyone's session memory of
+   * the other assistants is gone — arguments, appearances, grudges — and
+   * every read grant is revoked, so a buddy starts back at zero and has to
+   * convince a stranger again. Open windows stay open; they simply know
+   * nothing and hold nothing. */
+  lobotomize(): void {
+    for (const timer of this.banterTimers) clearTimeout(timer)
+    this.banterTimers = []
+    this.pendingAck = undefined
+    this.buddyStates.clear()
+    this.buddyQuips.clear()
+    this.threads.clear()
+    this.readAccess.clear()
+    this.readAccess.add('clippy')
+    this.pendingReadRequests.clear()
+    this.readGrantsIssued = 0
+    this.recentSummons.length = 0
+  }
+
   private get viewer(): ClippyViewer | undefined {
     return this.host.viewer
   }
@@ -285,6 +340,15 @@ export class BuddyCoordinator {
   /** Does this agent currently hold read access to the project files? */
   canRead(agent: string): boolean {
     return this.readAccess.has(agent)
+  }
+
+  /** Has this agent been told to shut up? Silence is total for a muted
+   * agent — no crosstalk, no acknowledgments, no arrivals announcing
+   * themselves — and it is checked at every point a line would be spoken
+   * rather than once at the top, because a mute that begins mid-exchange
+   * has to catch the lines already in flight. */
+  private silenced(agent: string): boolean {
+    return this.host.isShushed?.(agent) === true
   }
 
   /** Every line any assistant speaks passes through here, which makes it the
@@ -368,7 +432,7 @@ export class BuddyCoordinator {
           if (!this.disposed) this.buddySay(agent, text, false)
         })
         .catch(() => {
-          if (!this.disposed) this.buddySay(agent, environmentLine(agent, climate.mood), false)
+          if (!this.disposed) this.buddySay(agent, flavorize(environmentLine(agent, climate.mood), FLAVOR, Math.random), false)
         })
     }, attempt === 0 ? ENVIRONMENT_REACTION_DELAY_MS : this.t.retryBackoffMs)
   }
@@ -396,6 +460,42 @@ export class BuddyCoordinator {
     }
   }
 
+  // --- Casting -------------------------------------------------------------
+
+  /** Who should turn up for this room right now.
+   *
+   * The single casting entry point: every place that used to roll its own
+   * `castForMood` (Clippy sending for help, a second opinion, a party guest)
+   * comes through here, so they all share one rotation memory. Whoever
+   * already has a window is skipped — a second opinion is a new voice, not
+   * the buddy already arguing in the corner — and whoever was sent for
+   * recently is held back so the roster actually gets used. A buddy that was
+   * turned off (by the user or by another assistant) is never a spontaneous
+   * choice: it stays gone until somebody summons it by name.
+   *
+   * Returns undefined only when there is genuinely nobody to cast. */
+  castFor(mood: SessionClimate['mood'], exclude: readonly string[] = []): string | undefined {
+    const eligible = this.config.cameos.filter(agent => !exclude.includes(agent))
+    const notTurnedOff = eligible.filter(agent => this.buddyRecord(agent).turnedOffBy === undefined)
+    const available = notTurnedOff.filter(agent => this.viewer?.isCameoOpen(agent) !== true)
+    const pool = available.length > 0 ? available : notTurnedOff
+    // Casting also knows what just HAPPENED, not only how it felt: the
+    // buddy who claims that kind of work gets a better shot at the summons,
+    // so the bird turns up for the failing suite and the wizard turns up for
+    // the broken build.
+    return castForMood(mood, pool, Math.random(), Math.random(), this.recentSummons, topicOf(this.climate?.beat))
+  }
+
+  /** Remember that this buddy was just sent for (rotation memory). */
+  private noteSummoned(agent: string): void {
+    const existing = this.recentSummons.indexOf(agent)
+    if (existing >= 0) this.recentSummons.splice(existing, 1)
+    this.recentSummons.push(agent)
+    if (this.recentSummons.length > RECENT_SUMMON_MEMORY) {
+      this.recentSummons.splice(0, this.recentSummons.length - RECENT_SUMMON_MEMORY)
+    }
+  }
+
   // --- Summons, clicks, menus ---------------------------------------------
 
   /** ↑↑↓↓←→←→ B A from the Clippy window. Bonzi stays until dismissed so the
@@ -411,7 +511,7 @@ export class BuddyCoordinator {
     if (this.disposed) return
     const record = this.buddyRecord(agent)
     this.viewer?.keepCameo(agent)
-    this.buddySay(agent, userTalkLine(agent, record))
+    this.buddySay(agent, flavorize(userTalkLine(agent, record), FLAVOR))
   }
 
   /** Right-click menu on a buddy: the same actions as Clippy, actually
@@ -421,7 +521,7 @@ export class BuddyCoordinator {
    * model is unavailable. */
   triggerBuddyAction(agent: string, kind: 'explain' | 'suggest' | 'roast'): void {
     if (this.disposed) return
-    const fallback = buddyMenuLine(agent, kind) || userTalkLine(agent)
+    const fallback = flavorize(buddyMenuLine(agent, kind) || userTalkLine(agent), FLAVOR)
     const asked = this.host.lastLineBy(agent) ?? this.host.lastLineBy('clippy') ?? ''
     const signal = AbortSignal.timeout(GENERATION_TIMEOUT_MS)
     const asAsked = kind === 'explain' ? 'Show me' : kind === 'suggest' ? 'What next?' : 'Be honest'
@@ -444,18 +544,34 @@ export class BuddyCoordinator {
    * makes an arrival read as "Clippy called someone in" instead of a rival
    * wandering past. The greeting reacts to the summoner's last line (or
    * Clippy's) when the model is available, otherwise leans on session memory. */
-  async summonBuddy(target: string, by = 'clippy', announce = false): Promise<void> {
+  async summonBuddy(
+    target: string,
+    by = 'clippy',
+    announce = false,
+    /** Why this window is opening. 'second-opinion' is the one the USER asked
+     * for, so the arrival owes them an actual opinion rather than another
+     * paperclip joke (see openingSystemPrompt). */
+    purpose: 'banter' | 'second-opinion' = 'banter',
+  ): Promise<void> {
     if (this.disposed || !this.config.cameos.includes(target) || target === by) return
     const record = this.buddyRecord(target)
     record.appeared += 1
     record.summonedBy = by
+    this.noteSummoned(target)
     if (announce) this.announceSummon(by, target)
     // Usually the memory-aware summon greeting; occasionally a jab at the
     // user's streak instead, when there is one worth mocking.
-    const fallback = openingGreeting(target, record, loadStats().streak, Math.random())
+    const fallback = flavorize(openingGreeting(target, record, loadStats().streak, Math.random()), FLAVOR)
     const context = by === 'clippy' ? this.host.lastLineBy('clippy') : this.host.lastLineBy(by)
-    const greeting = await this.openingLine(target, context, fallback)
+    const greeting = await this.openingLine(target, context, fallback, purpose)
     if (this.disposed || !this.viewer) return
+    // A shushed buddy's window still opens (a summon is real), but it does
+    // not announce itself: no arrivals announcing themselves while muted.
+    if (this.silenced(target)) {
+      this.host.noteMissed?.(target, greeting)
+      this.viewer.summonCameo(target, shushedLine(), undefined)
+      return
+    }
     this.noteSpoken(target, greeting)
     this.viewer.summonCameo(target, greeting, choiceSetFor(greeting))
     // The newly arrived buddy's line is heard by everyone else.
@@ -465,18 +581,32 @@ export class BuddyCoordinator {
   /** The summoner says out loud that it is sending for somebody, so the new
    * window has a visible cause. */
   private announceSummon(by: string, target: string): void {
-    const line = summonAnnouncement(by, target)
-    if (by === 'clippy') this.host.showClippyBalloon(line, false)
-    else if (this.viewer?.isCameoOpen(by) === true) this.viewer.sayTo(by, line)
+    const line = flavorize(summonAnnouncement(by, target), FLAVOR)
+    // showClippyBalloon already checks Clippy's own mute (and files what he
+    // missed); a buddy summoner needs the same guard here, since sayTo has
+    // no mute check of its own.
+    if (by === 'clippy') {
+      this.host.showClippyBalloon(line, false)
+      return
+    }
+    if (this.silenced(by)) {
+      this.host.noteMissed?.(by, line)
+      return
+    }
+    if (this.viewer?.isCameoOpen(by) === true) this.viewer.sayTo(by, line)
   }
 
   /** Clippy's in-character impulses, decided as part of the line. This is
    * the ONLY way a rival turns up on its own: either the model wrote a
    * `summon` (Clippy wants somebody dragged into this moment) or the room is
    * bad enough that he sends for help himself. Nothing appears by dice roll
-   * on a plain balloon any more — if a window opened, Clippy opened it. */
+   * on a plain balloon any more — if a window opened, Clippy opened it.
+   * Except when Clippy is off: a muted (Shut up / /clippy shush) Clippy
+   * sends for nobody, so no buddy window opens on its own no matter what a
+   * balloon he was asked for said. */
   maybeActOn(balloon: { summon?: string }): void {
     if (this.disposed || !this.viewer) return
+    if (this.silenced('clippy')) return
     const target = balloon.summon
     if (target !== undefined) {
       if (this.viewer.isCameoOpen(target) || !this.config.cameos.includes(target)) return
@@ -496,9 +626,9 @@ export class BuddyCoordinator {
     // He only reaches for the phone when something is actually going on.
     if (climate === undefined || !isRemarkable(climate)) return
     if (Math.random() >= this.config.cameoChance) return
-    const available = this.config.cameos.filter(agent => this.viewer?.isCameoOpen(agent) !== true)
-    if (available.length === 0) return
-    const agent = castForMood(climate.mood, available, Math.random(), Math.random()) ?? available[0]!
+    if (this.config.cameos.every(agent => this.viewer?.isCameoOpen(agent) === true)) return
+    const agent = this.castFor(climate.mood)
+    if (agent === undefined) return
     const record = this.buddyRecord(agent)
     record.interruptCount += 1
     void this.summonBuddy(agent, 'clippy', true)
@@ -527,7 +657,13 @@ export class BuddyCoordinator {
     if (byRecord !== undefined && !byRecord.turnedOff.includes(victim)) byRecord.turnedOff.push(victim)
     this.viewer.closeCameo(victim)
     this.forgetWith(victim)
-    const line = turnOffLine(by, victim)
+    const line = flavorize(turnOffLine(by, victim), FLAVOR)
+    // turnOffBuddy speaks straight through sayTo (even for Clippy), so both
+    // sides of the mute guard belong here.
+    if (this.silenced(by)) {
+      this.host.noteMissed?.(by, line)
+      return
+    }
     if (by === 'clippy') this.viewer.sayTo('clippy', line)
     else if (this.viewer.isCameoOpen(by)) this.viewer.sayTo(by, line)
   }
@@ -547,7 +683,7 @@ export class BuddyCoordinator {
     // The button's promise is kept first, so the reply lands on something
     // that is already happening.
     this.applyBuddyEffect(agent, effect, pick, asked)
-    const fallback = fallbackReaction ?? buddyChoiceFallback(agent, effect)
+    const fallback = flavorize(fallbackReaction ?? buddyChoiceFallback(agent, effect), FLAVOR)
     const signal = AbortSignal.timeout(GENERATION_TIMEOUT_MS)
     // Only the "real work" buttons (explain, suggest) may spend a granted
     // buddy's read access; accept, party, stats and the rest never touch
@@ -576,7 +712,7 @@ export class BuddyCoordinator {
       // with, unless the label named somebody specific.
       const named = agentNamedIn(label, this.config.cameos)
       const partner = named ?? BANTER_PARTNERS[agent] ?? this.config.cameos.find(candidate => candidate !== agent)
-      if (partner !== undefined && partner !== agent) void this.summonBuddy(partner, agent, true)
+      if (partner !== undefined && partner !== agent) void this.summonBuddy(partner, agent, true, 'second-opinion')
       return
     }
     if (effect === 'party' || effect === 'stats') this.host.runHostEffect(effect)
@@ -586,6 +722,12 @@ export class BuddyCoordinator {
    * may answer the line. */
   buddySay(agent: string, text: string, offerChoices = true): void {
     if (this.disposed || !this.viewer) return
+    // A shushed buddy stays on screen and stays silent, but files what it
+    // would have said so it has one thing to say on unmute.
+    if (this.silenced(agent)) {
+      this.host.noteMissed?.(agent, text)
+      return
+    }
     this.noteSpoken(agent, text)
     if (offerChoices) {
       this.viewer.sayTo(agent, text, choiceSetFor(text))
@@ -603,24 +745,99 @@ export class BuddyCoordinator {
    * whatever he just said. */
   inviteToParty(): void {
     if (this.disposed || this.config.cameos.length === 0 || this.config.cameoChance <= 0) return
-    const available = this.config.cameos.filter(agent => this.viewer?.isCameoOpen(agent) !== true)
-    if (available.length === 0) return
-    const mood = this.climate?.mood ?? 'delighted'
-    const agent = castForMood(mood, available, Math.random(), Math.random()) ?? available[0]!
+    if (this.config.cameos.every(agent => this.viewer?.isCameoOpen(agent) === true)) return
+    const agent = this.castFor(this.climate?.mood ?? 'delighted')
+    if (agent === undefined) return
     void this.summonBuddy(agent, 'clippy', true)
+  }
+
+  // --- The assistants' board meeting ---------------------------------------
+
+  /** Convene every assistant on the desktop and take the matter to
+   * committee: each attendee proposes exactly one next step in character,
+   * the lines land one at a time on the existing floor, and Clippy closes
+   * as chair with the committee's recommendation (buttons and all, so the
+   * recommendation is a real offer you can accept).
+   *
+   * Every piece underneath this already worked — summoning, the floor,
+   * threaded crosstalk. What is new is the ORDER OF BUSINESS: a structured,
+   * bounded, one-at-a-time deliberation instead of a shouting match.
+   *
+   * The meeting is always somebody's doing (the user asked, or Clippy did),
+   * so attendees are summoned the same way any other summon works. */
+  async holdBoardMeeting(calledBy = 'clippy'): Promise<void> {
+    if (this.disposed || !this.viewer) return
+    if (this.silenced('clippy')) return
+    const open = this.config.cameos.filter(agent => this.viewer?.isCameoOpen(agent) === true)
+    const needed = Math.max(0, BOARD_MEETING_SIZE - open.length)
+    const invited = this.config.cameos.filter(agent => !open.includes(agent)).slice(0, needed)
+    this.host.showClippyBalloon(BOARD_MEETING_OPENING, false)
+    for (const agent of invited) {
+      if (this.disposed) return
+      await this.summonBuddy(agent, calledBy, false)
+    }
+    const attendees = [...open, ...invited].filter(agent => !this.silenced(agent))
+    if (attendees.length === 0) {
+      this.host.showClippyBalloon(BOARD_MEETING_QUORUM, false)
+      return
+    }
+    const minutes: string[] = []
+    for (const agent of attendees) {
+      if (this.disposed || !this.viewer) return
+      if (!this.viewer.isCameoOpen(agent)) continue
+      const line = await this.boardLine(agent, 'proposal', minutes)
+      if (line === undefined) continue
+      minutes.push(`${agentLabel(agent)}: ${line}`)
+      // Straight to the window: a meeting is a meeting, not an excuse for
+      // everyone to start replying to everyone (the floor still serializes
+      // the delivery, so the agenda reads in order).
+      this.buddySay(agent, line, false)
+      await this.pause(this.t.boardBeatMs)
+    }
+    if (this.disposed) return
+    const verdict = await this.boardLine('clippy', 'recommendation', minutes)
+    this.host.showClippyBalloon(verdict ?? BOARD_MEETING_FALLBACK, true)
+  }
+
+  /** One meeting line, or undefined when the model could not produce one —
+   * a silent attendee is better than a canned one pretending to deliberate. */
+  private async boardLine(agent: string, role: 'proposal' | 'recommendation', minutes: readonly string[]): Promise<string | undefined> {
+    try {
+      const signal = AbortSignal.timeout(GENERATION_TIMEOUT_MS)
+      return await generateBoardLine(this.ctx, signal, agent, role, minutes, this.modelRoute())
+    } catch {
+      return undefined
+    }
+  }
+
+  /** A tracked pause between meeting beats, so dispose can cut the meeting
+   * short instead of leaving a chain of timers talking to a dead session. */
+  private pause(ms: number): Promise<void> {
+    return new Promise(resolve => {
+      this.track(() => resolve(), ms)
+    })
   }
 
   /** The opening line for a buddy that is about to appear: generated against
    * the context line (Clippy's last words, or the summoner's) so the arrival
    * lands as a real reaction — pun, mockery, or advice — with the canned
    * greeting as the fallback when the model is unavailable or slow. */
-  private async openingLine(agent: string, context: string | undefined, fallback: string): Promise<string> {
+  private async openingLine(
+    agent: string,
+    context: string | undefined,
+    fallback: string,
+    purpose: 'banter' | 'second-opinion' = 'banter',
+  ): Promise<string> {
     if (context === undefined) return fallback
     try {
-      const signal = AbortSignal.timeout(OPENING_TIMEOUT_MS)
+      // An opinion the user asked for is worth waiting a little longer for
+      // than a drive-by quip.
+      const signal = AbortSignal.timeout(purpose === 'second-opinion' ? SECOND_OPINION_TIMEOUT_MS : OPENING_TIMEOUT_MS)
       // The arrival carries the grudge: a buddy that was switched off earlier
       // and is back now opens like it.
-      return await generateOpeningLine(this.ctx, signal, agent, context, this.modelRoute(), this.memoryFor(agent))
+      return await generateOpeningLine(
+        this.ctx, signal, agent, context, this.modelRoute(), this.memoryFor(agent), purpose, this.powersFor(agent),
+      )
     } catch {
       return fallback
     }
@@ -656,13 +873,13 @@ export class BuddyCoordinator {
     if (!opener.arguedWith.includes(partner)) opener.arguedWith.push(partner)
     partnerRecord.appeared += 1
     partnerRecord.summonedBy = agent
-    const line = banterReply(agent, partnerRecord)
+    const line = flavorize(banterReply(agent, partnerRecord), FLAVOR)
     this.noteSpoken(partner, line)
     this.viewer?.summonCameo(partner, line, choiceSetFor(line))
     // The opener answers the greeter through the model (so the argument is
     // not a broken record of canned loop-lines); the canned rebuttal is the
     // fallback when the model is unavailable.
-    this.scheduleReply(agent, partner, line, 0, banterRebuttal(agent, partner, opener))
+    this.scheduleReply(agent, partner, line, 0, flavorize(banterRebuttal(agent, partner, opener), FLAVOR))
     if (this.config.annoyanceChance > 0 && Math.random() < this.config.annoyanceChance) {
       this.track(() => {
         if (this.disposed) return
@@ -675,7 +892,9 @@ export class BuddyCoordinator {
 
   /** Clippy's canned acknowledgments, used when everybody (including Clippy)
    * rolled below the crosstalk chance — always in Clippy's own voice,
-   * referencing the speaker. */
+   * referencing the speaker. The opener varies and the trailing question is
+   * dropped half the time, so an acknowledgment does not always sound like
+   * a form letter. */
   private cannedAckFor(speaker: string): string {
     const label = agentLabel(speaker)
     const pool = [
@@ -686,7 +905,7 @@ export class BuddyCoordinator {
       `It looks like ${label} has joined the meeting uninvited. Would you like help taking minutes?`,
       `It looks like ${label} is editorializing again. Would you like help redacting it?`,
     ]
-    return pool[Math.floor(Math.random() * pool.length)]!
+    return flavorize(pool[Math.floor(Math.random() * pool.length)]!, FLAVOR)
   }
 
   /** After `speaker` says a line, EVERYONE else who is open may answer it
@@ -745,6 +964,10 @@ export class BuddyCoordinator {
    * conversation that has already happened. */
   private scheduleGuaranteedAck(speaker: string, line: string, attempt = 0): void {
     if (this.disposed) return
+    // The "never left hanging" guarantee knows to skip a muted Clippy: he
+    // cannot acknowledge anything, and the buddy's line is left hanging on
+    // purpose this time.
+    if (this.silenced('clippy')) return
     const delay = attempt === 0
       ? this.t.crosstalkDelayMs + this.t.crosstalkStaggerMs + this.t.guaranteedAckExtraMs
       : this.t.retryBackoffMs
@@ -823,7 +1046,7 @@ export class BuddyCoordinator {
     }
     // Model unavailable? Reply in the agent's own canned voice — Clippy's
     // counter uses his acknowledgment pool so he never borrows a buddy's words.
-    const content = text ?? fallback ?? (listener === 'clippy' ? this.cannedAckFor(speaker) : cannedReplyFor(listener, speaker))
+    const content = text ?? fallback ?? flavorize(listener === 'clippy' ? this.cannedAckFor(speaker) : cannedReplyFor(listener, speaker), FLAVOR)
     this.rememberSaid(listener, speaker, content)
     const thread = this.threadFor(listener, speaker)
     // A cooled-down pair starts a FRESH exchange window. Without this reset
@@ -853,8 +1076,11 @@ export class BuddyCoordinator {
   private crosstalkListeners(speaker: string): string[] {
     if (!this.viewer) return []
     const open = this.config.cameos.filter(agent => this.viewer?.isCameoOpen(agent) === true)
-    if (speaker === 'clippy') return open
-    return ['clippy', ...open.filter(agent => agent !== speaker)]
+    const all = speaker === 'clippy' ? open : ['clippy', ...open.filter(agent => agent !== speaker)]
+    // A shushed agent takes no reply slots at all: it is not simply quiet
+    // when its turn comes, it is never dealt a turn, so the slots go to
+    // whoever can still talk instead of being spent on silence.
+    return all.filter(agent => !this.silenced(agent))
   }
 
   /** Fisher–Yates over a copy: reply slots are handed out in random order
@@ -876,6 +1102,10 @@ export class BuddyCoordinator {
    * mechanism; a buddy's goes to that buddy window. */
   private speak(agent: string, content: string): void {
     if (this.disposed || !this.viewer) return
+    if (this.silenced(agent)) {
+      this.host.noteMissed?.(agent, content)
+      return
+    }
     this.noteSpoken(agent, content)
     if (agent === 'clippy') this.host.showClippyBalloon(content, false)
     else if (this.viewer.isCameoOpen(agent)) this.viewer.sayTo(agent, content)

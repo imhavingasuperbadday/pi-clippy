@@ -97,12 +97,19 @@ function pickVoice(agentName) {
 const HOLD_MS = parseInt(PARAMS.get('holdMs') || '8000', 10) || 8000;
 // Persistent buddies (summoned or kept) do not dismiss themselves.
 let PERSISTENT = PARAMS.get('persistent') === '1';
+// How often a buddy window tells the server it is still on screen. Must stay
+// comfortably under the server's staleness cutoff (CAMEO_STALE_MS in
+// src/viewer.ts) so a couple of missed pings never evict a live window.
+const CAMEO_ALIVE_MS = 20_000;
 
 // --- One-message-at-a-time floor -----------------------------------------
 // The server voices exactly one balloon at a time and waits for this window
 // to report that its message is finished (balloon closed AND voice done)
 // before it voices the next. Reporting precisely is what stops a buddy's
-// message from loading right after — or over — the one before it.
+// message from loading right after — or over — the one before it. The one
+// exception: a short zinger from another window may cut this window's VOICE
+// off mid-sentence (a voice-stop event cancels the speech but keeps the
+// balloon up for reading).
 let balloonShownDone = false;
 let balloonVoiceDone = !VOICE;
 let balloonGoneReported = false;
@@ -219,6 +226,14 @@ const STARE_WORDS = ['Hey.', 'Boo.', 'Yes?', '...', 'Still here.', 'Hm?'];
 const STARE_AFTER_MS = 7_000;
 const STARE_COOLDOWN_MS = 90_000;
 const STARE_CHANCE = 0.35;
+// Varied openers for the few lines the client authors itself (the server
+// dresses every other line before it arrives). "It looks like" stays in the
+// mix — classic, but not the only way in.
+const STATUS_OPENERS = ['It looks like', 'So', 'Ah,', 'Well,', 'I see', 'Now', 'Hm,'];
+function openStatus(fragment) {
+  const opener = STATUS_OPENERS[Math.floor(Math.random() * STATUS_OPENERS.length)];
+  return `${opener} ${fragment}`;
+}
 // Ultra-rare: Clippy's own little marker-cry. One in ~a hundred stare
 // moments, he says the one string that was never meant to be spoken.
 const LEAK_CHANCE = 0.008;
@@ -253,14 +268,21 @@ function cancelStareWord() {
   }
 }
 
-function speak(text, choices) {
+function speak(text, choices, request) {
   if (!agent) return;
   cancelStareWord(); // a real line cancels the stare
+  wakeUp(false); // he does not talk in his sleep
+  scheduleSleep();
   const hasChoices = Array.isArray(choices) && choices.length > 0;
   // A new balloon means the previous one (if any) has been read on screen;
   // reset the gone-report for the fresh message that is about to play.
   resetBalloonGone();
   renderChoices(hasChoices ? choices.map(String) : null);
+  // The drafted instruction, if this balloon carries one. It is already
+  // inside `text`; this only arranges to set it apart once the typewriter
+  // has finished writing it, so the thing the button will send is the thing
+  // the eye lands on.
+  armRequestHighlight(typeof request === 'string' ? request : null, text);
   // clippyjs arms a delayed hide when the previous balloon closes; if it
   // fires after a new speak() begins, it hides the fresh balloon mid-typing
   // (the "Clippy talks but no dialog opens" bug). Cancel it first.
@@ -288,6 +310,10 @@ function speak(text, choices) {
     }
   }
   agent.speak(text);
+  // The library rebuilds the balloon's inline styles every time it opens,
+  // so the mood ring is re-applied per line rather than set once.
+  applyMoodColor();
+  setTimeout(applyMoodColor, 60);
   // Hand the floor back when this message is done (typing + hold, + a hint
   // for the voice): the next message then starts one-at-a-time, never on
   // top of this one.
@@ -322,6 +348,82 @@ function speak(text, choices) {
   }
 }
 
+// --- The drafted request, set apart inside the balloon ----------------------
+//
+// A balloon that offers to hand work to the coding agent prints the exact
+// instruction in quotes, and pressing the button sends that string verbatim.
+// The quoting IS the consent mechanism, so it is worth being able to see at a
+// glance. This wraps the quoted span in a boxed, monospaced style.
+//
+// It is presentational and nothing more: the text is not changed, not
+// reordered, and not re-rendered anywhere else. If the quoted string cannot be
+// found character-for-character in what is on screen, nothing is highlighted —
+// a highlight that guessed would be worse than none.
+
+const REQUEST_CSS = `
+  .clippy-request {
+    display: inline-block;
+    margin: 3px 0;
+    padding: 2px 6px;
+    background: #ffffe1;
+    border: 1px solid #b8b48a;
+    font-family: "Lucida Console", Consolas, monospace;
+    font-size: 11px;
+    color: #1a1a1a;
+  }
+`;
+
+let requestStyle = null;
+let requestTimer = null;
+
+function armRequestHighlight(request, text) {
+  if (requestTimer !== null) {
+    clearInterval(requestTimer);
+    requestTimer = null;
+  }
+  if (!request || !text.includes(`"${request}"`)) return;
+  if (requestStyle === null) {
+    requestStyle = document.createElement('style');
+    requestStyle.textContent = REQUEST_CSS;
+    document.head.appendChild(requestStyle);
+  }
+  // The library retypes textContent once per word, so any markup written
+  // before it finishes is wiped. Wait for the typewriter to stop, then write
+  // once. The interval also gives up on its own so a balloon that never
+  // finishes cannot leave a timer running for the rest of the session.
+  let attempts = 0;
+  requestTimer = setInterval(() => {
+    attempts += 1;
+    const balloon = agent?._balloon;
+    const content = balloon?._content;
+    if (attempts > 300 || !content) {
+      clearInterval(requestTimer);
+      requestTimer = null;
+      return;
+    }
+    if (balloon._active) return; // still typing
+    if (content.textContent.indexOf(`"${request}"`) < 0) return;
+    clearInterval(requestTimer);
+    requestTimer = null;
+    applyRequestHighlight(content, request);
+  }, 200);
+}
+
+function applyRequestHighlight(content, request) {
+  const whole = content.textContent;
+  const quoted = `"${request}"`;
+  const at = whole.indexOf(quoted);
+  if (at < 0) return;
+  content.textContent = '';
+  content.appendChild(document.createTextNode(whole.slice(0, at)));
+  const span = document.createElement('span');
+  span.className = 'clippy-request';
+  span.textContent = quoted;
+  content.appendChild(span);
+  content.appendChild(document.createTextNode(whole.slice(at + quoted.length)));
+  scheduleRelayout();
+}
+
 // --- Choice buttons: the classic Office "Yes / Yes" options in the balloon ---
 
 const CHOICES_CSS = `
@@ -332,6 +434,7 @@ const CHOICES_CSS = `
     margin-top: 8px;
   }
   .clippy-choices button {
+    position: relative;
     font: 11px Tahoma, "Microsoft Sans", sans-serif;
     color: black;
     background: #d4d0c8;
@@ -342,9 +445,24 @@ const CHOICES_CSS = `
     min-width: 56px;
     cursor: pointer;
   }
+  .clippy-choices button:hover {
+    background: #dcd9d2;
+  }
+  .clippy-choices button:focus-visible,
+  .clippy-choices button.clippy-choice-default {
+    outline: 1px dotted #404040;
+    outline-offset: -3px;
+  }
   .clippy-choices button:active {
     border-color: #404040 #ffffff #ffffff #404040;
     box-shadow: none;
+  }
+  /* The number key that presses this button, in the Office 97 way: small,
+     underlined, and out of the way until you look for it. */
+  .clippy-choices .clippy-key {
+    text-decoration: underline;
+    margin-right: 4px;
+    opacity: 0.65;
   }
 `;
 
@@ -368,13 +486,18 @@ function renderChoices(choices) {
   choices.forEach((label, index) => {
     const button = document.createElement('button');
     button.type = 'button';
-    button.textContent = label;
+    // The label is what carries the meaning (the host derives the effect from
+    // exactly these words), so it is rendered as text and never as markup.
+    const key = document.createElement('span');
+    key.className = 'clippy-key';
+    key.textContent = String(index + 1);
+    button.appendChild(key);
+    button.appendChild(document.createTextNode(label));
+    button.title = `${label}  (press ${index + 1})`;
+    if (index === 0) button.classList.add('clippy-choice-default');
     button.addEventListener('click', (event) => {
       event.stopPropagation();
-      row.remove();
-      scheduleRelayout();
-      markBalloonClosed(); // the user answered: free the floor without waiting the hold
-      postCommand('choice', { index, label });
+      answerChoice(row, index, label);
     });
     row.appendChild(button);
   });
@@ -386,6 +509,31 @@ function renderChoices(choices) {
   // The grown balloon needs a re-fit of the window around it.
   scheduleRelayout();
   setTimeout(scheduleRelayout, 300); // after the typewriter finishes
+}
+
+/** Answer the balloon: one press, one send, buttons gone. Shared by the
+ * click handler and the number-key shortcut so both paths behave identically
+ * — in particular, both remove the row first, so a double press can never
+ * post two answers for one balloon. */
+function answerChoice(row, index, label) {
+  if (!row.isConnected) return;
+  row.remove();
+  scheduleRelayout();
+  markBalloonClosed(); // the user answered: free the floor without waiting the hold
+  postCommand('choice', { index, label });
+}
+
+/** The number keys press the buttons. Clippy's window has no text input, so
+ * 1-9 are free, and reaching for the mouse to answer a paperclip is the kind
+ * of small friction that makes people stop answering him. */
+function pressChoiceByNumber(number) {
+  const row = document.getElementById('clippy-choices');
+  if (!row) return false;
+  const button = row.children[number - 1];
+  if (!(button instanceof HTMLButtonElement)) return false;
+  const label = button.textContent.replace(/^\d+/u, '');
+  answerChoice(row, number - 1, label);
+  return true;
 }
 
 // --- Layout: the window is exactly the agent, growing only for the balloon ---
@@ -572,6 +720,9 @@ async function connect() {
       if (agent._resizeHandle) window.removeEventListener('resize', agent._resizeHandle);
     }
     scheduleRelayout();
+    ensureAntics();
+    scheduleSleep();
+    startLeaning();
   } catch (error) {
     // Both local and CDN vendor sources failed; nothing to show.
     console.error(`${AGENT} failed to load:`, error);
@@ -582,6 +733,12 @@ async function connect() {
   if (CAMEO_MODE) {
     // Rival assistant: announce readiness so the server delivers its line.
     postCommand('cameo-ready', { agent: AGENT });
+    // Then keep reporting in. `pagehide` covers a window that closes politely,
+    // but a shell that is killed, crashes, or sleeps never sends it — and an
+    // agent the server still believes is on screen can never be summoned
+    // again, and stalls the message floor every time somebody addresses it.
+    // The heartbeat is what lets the server notice the window is gone.
+    setInterval(() => postCommand('cameo-alive', { agent: AGENT }), CAMEO_ALIVE_MS);
     // Fallback close if the server never delivers an opening line.
     if (!PERSISTENT) setTimeout(() => shell?.close(), HOLD_MS + 15_000);
     // Tell the server when this window goes away so a future summon reopens it.
@@ -600,7 +757,7 @@ async function connect() {
   events.addEventListener('open', () => {
     if (!CAMEO_MODE && !connected) {
       connected = true;
-      speak('It looks like pi is back. Would you like help continuing?');
+      speak(openStatus('pi is back. Would you like help continuing?'));
     }
   });
   events.addEventListener('clippy', (event) => {
@@ -618,9 +775,35 @@ async function connect() {
     // its own box and reads it in its own voice while Clippy's window shows
     // the same words. Buddy windows only ever display to:-addressed lines.
     if (message.to === undefined && CAMEO_MODE) return;
+    if (message.type === 'voice-stop') {
+      // A short zinger from another window cut this window's speech off.
+      // Stop the voice but keep the balloon up for reading, and release the
+      // voice half of the gone-report so the floor never waits on speech
+      // that is no longer playing.
+      if (VOICE && typeof speechSynthesis !== 'undefined') {
+        try {
+          speechSynthesis.cancel();
+        } catch {
+          // voice is best-effort
+        }
+      }
+      markBalloonVoiceDone();
+      return;
+    }
     if (message.type === 'balloon') {
-      speak(message.text, message.choices);
+      speak(message.text, message.choices, message.request);
       if (CAMEO_MODE) resetCameoClose();
+      return;
+    }
+    if (message.type === 'shush') {
+      // Tape across the mouth: visible at a glance, because the whole joke
+      // is that you will forget he is muted.
+      const isShushed = message.shushed === true;
+      setShushed(isShushed);
+      // Tell the shell too, so the right-click menu item stays in sync
+      // however the mute changed (typed egg, strike, or timer, not just a
+      // menu click).
+      shell?.setShushed?.(AGENT, isShushed);
       return;
     }
     if (CAMEO_MODE && message.type === 'persist' && message.to === AGENT) {
@@ -632,9 +815,39 @@ async function connect() {
       shell?.close();
       return;
     }
-    if (CAMEO_MODE) return; // cameos ignore state and party events
+    // Everything below belongs to Clippy's own window: the state animations,
+    // the party parade, and the antics layer. A buddy window stops here —
+    // and this guard must stay BELOW persist/close, which are addressed to
+    // buddy windows and are the only way a summoned buddy is kept or shut.
+    if (CAMEO_MODE) return;
+    if (message.type === 'effect') {
+      runEffect(message.effect, message);
+      return;
+    }
+    if (message.type === 'destiny') {
+      setDestinyBadge(typeof message.text === 'string' ? message.text : null);
+      return;
+    }
+    if (message.type === 'hat') {
+      setHat(message.glyph);
+      return;
+    }
+    if (message.type === 'mood') {
+      moodColor = typeof message.color === 'string' ? message.color : null;
+      // Older servers send only a colour; the ring then draws exactly as it
+      // always did rather than vanishing.
+      moodWidth = typeof message.width === 'number' ? message.width : 0;
+      moodGlow = typeof message.glow === 'number' ? message.glow : 0;
+      applyMoodColor();
+      return;
+    }
     if (message.type === 'state') {
       setState(message.state);
+      // A long-running command gets a pacing paperclip; any state change
+      // also means the session is alive, so the sleep clock restarts.
+      notePacing(message.state);
+      wakeUp(false);
+      scheduleSleep();
       if (message.state === 'idle') cancelStareWord();
       else maybeScheduleStareWord();
     }
@@ -644,7 +857,7 @@ async function connect() {
     // EventSource reconnects automatically; say it once per outage.
     if (!CAMEO_MODE && connected) {
       connected = false;
-      speak('It looks like pi is not running. Would you like help starting it?');
+      speak(openStatus('pi is not running. Would you like help starting it?'));
     }
   };
 }
@@ -690,6 +903,566 @@ function startParty() {
   step();
 }
 
+// --- Antics: overlays, hats, moods, and the small physical business -------
+//
+// Everything below is CSS on the sprite or an overlay INSIDE the window the
+// page already occupies. Nothing here calls shell.setBounds or
+// shell.setPosition: window movement is this renderer's one known
+// failure mode (see the idempotency guard in relayout), so the whole
+// physical-presence layer is built to be incapable of feeding it. The
+// sprite moves; the window never does.
+
+const ANTIC_CSS = `
+  #clippy-overlay {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    overflow: visible;
+    z-index: 3;
+  }
+  #clippy-destiny {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+    font: 9px Tahoma, "Microsoft Sans", sans-serif;
+    color: #2b2b2b;
+    background: rgba(255, 255, 225, 0.92);
+    border: 1px solid #b8b48a;
+    padding: 0 3px;
+    line-height: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+  }
+  #clippy-hat {
+    position: absolute;
+    left: 50%;
+    top: -2px;
+    transform: translateX(-50%) rotate(-12deg);
+    font-size: 22px;
+    line-height: 1;
+    filter: drop-shadow(0 1px 1px rgba(0,0,0,0.35));
+  }
+  #clippy-tape {
+    position: absolute;
+    left: 50%;
+    top: 46%;
+    width: 34px;
+    height: 9px;
+    margin-left: -17px;
+    background: #efe7c8;
+    border: 1px solid #b9ad84;
+    transform: rotate(-8deg);
+    opacity: 0.92;
+  }
+  #clippy-picket {
+    position: absolute;
+    left: 4px;
+    top: 2px;
+    font-size: 11px;
+    font-family: Tahoma, "Microsoft Sans", sans-serif;
+    color: #222;
+    background: #fffbe6;
+    border: 1px solid #7a6f42;
+    padding: 1px 3px;
+    transform: rotate(-6deg);
+  }
+  .clippy-anticnote {
+    position: absolute;
+    left: 50%;
+    top: 30%;
+    transform: translateX(-50%);
+    font: 13px Tahoma, "Microsoft Sans", sans-serif;
+    white-space: nowrap;
+    color: #222;
+    text-shadow: 0 1px 0 #fff;
+  }
+  .clippy-z {
+    position: absolute;
+    font: italic 13px Tahoma, serif;
+    color: #3a3a3a;
+    animation: clippy-z-float 2.4s ease-out infinite;
+  }
+  @keyframes clippy-z-float {
+    0% { transform: translate(0, 0) scale(0.7); opacity: 0; }
+    25% { opacity: 0.9; }
+    100% { transform: translate(14px, -26px) scale(1.15); opacity: 0; }
+  }
+  .clippy-coin {
+    position: absolute;
+    top: -14px;
+    font-size: 14px;
+    animation: clippy-coin-fall 1.5s linear forwards;
+  }
+  @keyframes clippy-coin-fall {
+    to { transform: translateY(160px) rotate(220deg); opacity: 0; }
+  }
+  .clippy-crumb {
+    position: absolute;
+    font-size: 11px;
+    animation: clippy-crumb-eat 1.1s ease-in forwards;
+  }
+  @keyframes clippy-crumb-eat {
+    0% { transform: translate(30px, 18px) scale(1); opacity: 1; }
+    100% { transform: translate(0, 0) scale(0.2); opacity: 0; }
+  }
+  .clippy-blush {
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(circle at 50% 45%, rgba(255,120,140,0.42), rgba(255,120,140,0) 62%);
+    animation: clippy-fade 2.6s ease-out forwards;
+  }
+  @keyframes clippy-fade { to { opacity: 0; } }
+  .clippy-rolling { animation: clippy-roll 950ms ease-in-out 1; }
+  @keyframes clippy-roll { to { transform: rotate(360deg); } }
+  .clippy-panic { animation: clippy-panic-shake 520ms ease-in-out 2; }
+  @keyframes clippy-panic-shake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-6px); }
+    75% { transform: translateX(6px); }
+  }
+  .clippy-ghost { filter: grayscale(1) brightness(1.3); opacity: 0.45; }
+  .clippy-asleep { filter: saturate(0.6) brightness(0.9); }
+  .clippy-content { animation: clippy-content-bob 900ms ease-in-out 2; }
+  @keyframes clippy-content-bob {
+    0%, 100% { transform: translateY(0) rotate(0deg); }
+    50% { transform: translateY(-4px) rotate(4deg); }
+  }
+  .clippy-startled { animation: clippy-jump 420ms ease-out 1; }
+  @keyframes clippy-jump {
+    0% { transform: translateY(0); }
+    35% { transform: translateY(-12px); }
+    100% { transform: translateY(0); }
+  }
+`;
+
+let anticStyle = null;
+let overlayEl = null;
+
+function ensureAntics() {
+  if (!agent) return null;
+  if (anticStyle === null) {
+    anticStyle = document.createElement('style');
+    anticStyle.textContent = ANTIC_CSS;
+    document.head.appendChild(anticStyle);
+  }
+  if (overlayEl === null || !overlayEl.isConnected) {
+    overlayEl = document.createElement('div');
+    overlayEl.id = 'clippy-overlay';
+    agent._el.appendChild(overlayEl);
+  }
+  return overlayEl;
+}
+
+/** Add a class to the sprite for a while, then take it off again. The
+ * sprite is a background image inside a fixed-size element, so a transform
+ * on it can never change the page's layout size — which is what keeps the
+ * whole antics layer out of the relayout loop. */
+function spriteClass(name, ms) {
+  if (!agent) return;
+  const el = agent._el;
+  el.classList.add(name);
+  setTimeout(() => el.classList.remove(name), ms);
+}
+
+/** One short line of overlay theatre (the flipped desk, mostly). */
+function anticNote(text, ms) {
+  const layer = ensureAntics();
+  if (!layer) return;
+  const note = document.createElement('div');
+  note.className = 'clippy-anticnote';
+  note.textContent = text;
+  layer.appendChild(note);
+  setTimeout(() => note.remove(), ms);
+}
+
+function rain(glyphs, count, className, ms) {
+  const layer = ensureAntics();
+  if (!layer) return;
+  for (let i = 0; i < count; i += 1) {
+    const bit = document.createElement('span');
+    bit.className = className;
+    bit.textContent = glyphs[Math.floor(Math.random() * glyphs.length)];
+    bit.style.left = `${Math.round(Math.random() * 100)}%`;
+    bit.style.animationDelay = `${Math.round(Math.random() * 500)}ms`;
+    layer.appendChild(bit);
+    setTimeout(() => bit.remove(), ms);
+  }
+}
+
+let ghostTimer = null;
+let picketEl = null;
+
+function runEffect(effect, message) {
+  if (!agent) return;
+  ensureAntics();
+  switch (effect) {
+    case 'barrel-roll':
+      spriteClass('clippy-rolling', 1_000);
+      return;
+    case 'coins':
+      rain(['🪙', '💰', '🪙'], 14, 'clippy-coin', 2_100);
+      return;
+    case 'tableflip':
+      anticNote('(╯°□°）╯︵ ┻━┻', 2_600);
+      spriteClass('clippy-startled', 460);
+      return;
+    case 'tableback':
+      anticNote('┬─┬ノ( º _ ºノ)', 2_600);
+      return;
+    case 'ghost': {
+      const ms = typeof message.ms === 'number' ? message.ms : 10_000;
+      agent._el.classList.add('clippy-ghost');
+      if (ghostTimer !== null) clearTimeout(ghostTimer);
+      ghostTimer = setTimeout(() => {
+        ghostTimer = null;
+        agent?._el.classList.remove('clippy-ghost');
+      }, ms);
+      return;
+    }
+    case 'sleep':
+      fallAsleep();
+      return;
+    case 'blush': {
+      const layer = ensureAntics();
+      if (!layer) return;
+      const tint = document.createElement('div');
+      tint.className = 'clippy-blush';
+      layer.appendChild(tint);
+      setTimeout(() => tint.remove(), 2_800);
+      return;
+    }
+    case 'panic':
+      spriteClass('clippy-panic', 1_100);
+      return;
+    case 'content':
+      spriteClass('clippy-content', 1_900);
+      return;
+    case 'feed':
+      rain(['📄'], 1, 'clippy-crumb', 1_300);
+      return;
+    case 'strike': {
+      const layer = ensureAntics();
+      if (!layer || picketEl !== null) return;
+      picketEl = document.createElement('div');
+      picketEl.id = 'clippy-picket';
+      picketEl.textContent = 'UNFAIR';
+      layer.appendChild(picketEl);
+      return;
+    }
+    case 'strike-over':
+      picketEl?.remove();
+      picketEl = null;
+      return;
+    default:
+      return;
+  }
+}
+
+// --- The hat --------------------------------------------------------------
+
+/** The background-goal badge: a tiny chip in the corner of the sprite saying
+ * how much of his edit budget he has spent. It lives INSIDE the sprite's own
+ * footprint (the overlay is inset:0 on a fixed-size element), so it can never
+ * change the window's layout size — the one thing this renderer must never do
+ * outside a real layout change. */
+function setDestinyBadge(text) {
+  const layer = ensureAntics();
+  if (!layer) return;
+  const existing = document.getElementById('clippy-destiny');
+  if (!text) {
+    existing?.remove();
+    return;
+  }
+  const badge = existing ?? document.createElement('div');
+  badge.id = 'clippy-destiny';
+  // Just the counter on screen; the whole sentence in the tooltip.
+  badge.textContent = text.replace(/^clippy destiny: /u, '');
+  badge.title = text;
+  if (!existing) layer.appendChild(badge);
+}
+
+function setHat(glyph) {
+  const layer = ensureAntics();
+  if (!layer) return;
+  let hat = document.getElementById('clippy-hat');
+  if (!glyph) {
+    hat?.remove();
+    return;
+  }
+  if (hat === null) {
+    hat = document.createElement('div');
+    hat.id = 'clippy-hat';
+    layer.appendChild(hat);
+  }
+  hat.textContent = glyph;
+}
+
+// --- The mood ring ---------------------------------------------------------
+
+// The balloon's border follows the session climate: its COLOUR is the mood,
+// its WEIGHT and halo are how strongly that mood is being felt. Two failures
+// and nine failures used to be the same shade of amber; now the ring gets
+// heavier as the room gets worse. Kept as plain variables and applied on
+// every speak(), because the library rebuilds the balloon's inline styles
+// whenever it reopens.
+//
+// Styling only — nothing here touches window bounds, which is the one part
+// of this renderer with a known layout-loop failure mode.
+let moodColor = null;
+let moodWidth = 0;
+let moodGlow = 0;
+
+function applyMoodColor() {
+  const balloon = balloonElement();
+  if (balloon === null) return;
+  balloon.style.borderColor = moodColor ?? '';
+  balloon.style.borderWidth = moodColor !== null && moodWidth > 0 ? `${moodWidth}px` : '';
+  balloon.style.boxShadow = moodColor !== null && moodGlow > 0
+    ? `0 0 ${Math.round(4 + moodGlow * 16)}px ${hexWithAlpha(moodColor, moodGlow)}`
+    : '';
+}
+
+// The ring's halo, as an rgba() of the mood colour. Anything that is not a
+// six-digit hex is left alone and simply gets no halo.
+function hexWithAlpha(hex, alpha) {
+  const match = /^#([0-9a-f]{6})$/i.exec(hex);
+  if (match === null) return 'transparent';
+  const value = parseInt(match[1], 16);
+  return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, ${alpha})`;
+}
+
+// --- Being shushed ---------------------------------------------------------
+
+let shushed = false;
+
+function setShushed(next) {
+  shushed = next;
+  const layer = ensureAntics();
+  if (!layer) return;
+  const existing = document.getElementById('clippy-tape');
+  if (!next) {
+    existing?.remove();
+    return;
+  }
+  if (existing === null) {
+    const tape = document.createElement('div');
+    tape.id = 'clippy-tape';
+    layer.appendChild(tape);
+  }
+  // Visibly muted at a glance, because the whole joke is that you will
+  // forget: tape across the mouth, and he stops animating at you.
+  if (VOICE && typeof speechSynthesis !== 'undefined') {
+    try {
+      speechSynthesis.cancel();
+    } catch {
+      // voice is best-effort
+    }
+  }
+}
+
+// --- Sleep -----------------------------------------------------------------
+
+const SLEEP_AFTER_MS = 5 * 60_000;
+let sleepTimer = null;
+let asleep = false;
+
+function fallAsleep() {
+  if (!agent || asleep) return;
+  asleep = true;
+  agent._el.classList.add('clippy-asleep');
+  agent.pause?.();
+  const layer = ensureAntics();
+  if (!layer) return;
+  for (let i = 0; i < 3; i += 1) {
+    const z = document.createElement('span');
+    z.className = 'clippy-z';
+    z.textContent = 'z';
+    z.style.left = '62%';
+    z.style.top = '18%';
+    z.style.animationDelay = `${i * 800}ms`;
+    z.dataset.sleep = '1';
+    layer.appendChild(z);
+  }
+}
+
+function wakeUp(report) {
+  if (!asleep) return;
+  asleep = false;
+  agent?._el.classList.remove('clippy-asleep');
+  agent?.resume?.();
+  for (const z of document.querySelectorAll('.clippy-z')) z.remove();
+  if (report) {
+    spriteClass('clippy-startled', 460);
+    postCommand('wake');
+  }
+  scheduleSleep();
+}
+
+/** The window is the screensaver: after a long quiet stretch he nods off.
+ * Any line, any click, any state change resets the clock. */
+function scheduleSleep() {
+  if (CAMEO_MODE) return;
+  if (sleepTimer !== null) clearTimeout(sleepTimer);
+  sleepTimer = setTimeout(() => {
+    sleepTimer = null;
+    if (!balloonVisible()) fallAsleep();
+  }, SLEEP_AFTER_MS);
+}
+
+// --- Pacing ----------------------------------------------------------------
+
+// A command that runs longer than ten seconds gets a paperclip pacing back
+// and forth. The SPRITE moves inside the window; the window bounds never
+// change, so this is safe by construction.
+const PACE_AFTER_MS = 10_000;
+let paceTimer = null;
+let pacing = false;
+let paceStep = 0;
+let paceInterval = null;
+
+function startPacing() {
+  if (pacing || !agent) return;
+  pacing = true;
+  paceInterval = setInterval(() => {
+    if (!agent) return;
+    paceStep = (paceStep + 1) % 4;
+    const offset = [0, 7, 0, -7][paceStep];
+    agent._el.style.marginLeft = `${offset}px`;
+  }, 550);
+}
+
+function stopPacing() {
+  if (paceTimer !== null) {
+    clearTimeout(paceTimer);
+    paceTimer = null;
+  }
+  if (paceInterval !== null) {
+    clearInterval(paceInterval);
+    paceInterval = null;
+  }
+  if (pacing && agent) agent._el.style.marginLeft = '0px';
+  pacing = false;
+}
+
+function notePacing(state) {
+  stopPacing();
+  if (state === 'searching' || state === 'thinking') {
+    paceTimer = setTimeout(startPacing, PACE_AFTER_MS);
+  }
+}
+
+// --- Leaning toward the cursor --------------------------------------------
+
+// He tilts a few degrees toward your pointer while idle. A rotate on the
+// sprite only — the window is never asked where it is, let alone moved.
+const LEAN_POLL_MS = 700;
+const MAX_LEAN_DEG = 7;
+
+function startLeaning() {
+  if (CAMEO_MODE || !shell?.cursorPoint) return;
+  setInterval(async () => {
+    if (!agent || asleep || shushed || balloonVisible() || drag !== null) return;
+    let point = null;
+    try {
+      point = await shell.cursorPoint();
+    } catch {
+      return;
+    }
+    if (point === null || typeof point.x !== 'number') return;
+    const centre = window.screenX + window.innerWidth / 2;
+    const delta = point.x - centre;
+    const lean = Math.max(-MAX_LEAN_DEG, Math.min(MAX_LEAN_DEG, delta / 90));
+    agent._el.style.transform = `rotate(${lean.toFixed(1)}deg)`;
+  }, LEAN_POLL_MS);
+}
+
+// --- Petting, startling, mashing, and sulking ------------------------------
+
+const PET_CLICKS = 3;
+const PET_WINDOW_MS = 1_800;
+const STARTLE_MS = 400;
+const CORNER_MARGIN = 24;
+const CORNER_COOLDOWN_MS = 10 * 60_000;
+
+let petClicks = [];
+let lastClickAt = 0;
+let lastCornerAt = 0;
+
+/** Three gentle clicks in a row is petting, not three questions. Returns
+ * true when this click was absorbed by the petting. */
+function notePetClick(now) {
+  petClicks = petClicks.filter(at => now - at < PET_WINDOW_MS);
+  petClicks.push(now);
+  if (petClicks.length < PET_CLICKS) return false;
+  petClicks = [];
+  postCommand('petted');
+  return true;
+}
+
+/** A very fast second click is a startle rather than a second question. */
+function noteStartle(now) {
+  const fast = now - lastClickAt < STARTLE_MS;
+  lastClickAt = now;
+  if (!fast) return false;
+  petClicks = [];
+  spriteClass('clippy-startled', 460);
+  postCommand('startled');
+  return true;
+}
+
+/** Parked in a screen corner: he mentions it, at most once in a while. */
+function noteCorner() {
+  if (CAMEO_MODE || !shell) return;
+  const now = Date.now();
+  if (now - lastCornerAt < CORNER_COOLDOWN_MS) return;
+  const nearLeft = window.screenX <= CORNER_MARGIN;
+  const nearTop = window.screenY <= CORNER_MARGIN;
+  const nearRight = window.screenX + window.innerWidth >= screen.width - CORNER_MARGIN;
+  const nearBottom = window.screenY + window.innerHeight >= screen.height - CORNER_MARGIN;
+  if (!((nearLeft || nearRight) && (nearTop || nearBottom))) return;
+  lastCornerAt = now;
+  postCommand('corner');
+}
+
+// Keyboard mash: ten or more keys inside a second, and the classic deadpan.
+const MASH_KEYS = 10;
+const MASH_WINDOW_MS = 1_000;
+const MASH_COOLDOWN_MS = 60_000;
+let mashTimes = [];
+let lastMashAt = 0;
+
+function noteKey(event) {
+  if (CAMEO_MODE) return;
+  const now = Date.now();
+  // Ctrl+L: the classic line, on demand. The window already has a key
+  // handler for the konami code; this is one more keycode.
+  if (event.ctrlKey && typeof event.key === 'string' && event.key.toLowerCase() === 'l') {
+    event.preventDefault();
+    postCommand('classic');
+    return;
+  }
+  if (event.ctrlKey || event.altKey || event.metaKey) return;
+  // 1-9 answer the balloon's option buttons. Checked before the mash
+  // counter so pressing "1" to say yes is never mistaken for a tantrum.
+  if (/^[1-9]$/u.test(event.key) && pressChoiceByNumber(Number(event.key))) {
+    event.preventDefault();
+    return;
+  }
+  mashTimes = mashTimes.filter(at => now - at < MASH_WINDOW_MS);
+  mashTimes.push(now);
+  if (mashTimes.length < MASH_KEYS) return;
+  mashTimes = [];
+  if (now - lastMashAt < MASH_COOLDOWN_MS) return;
+  lastMashAt = now;
+  postCommand('mash');
+}
+
+document.addEventListener('keydown', noteKey);
+
 // --- Konami code (clippy only): ↑↑↓↓←→←→ B A summons Bonzi ---
 
 const KONAMI = ['ArrowUp', 'ArrowUp', 'ArrowDown', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'ArrowLeft', 'ArrowRight', 'b', 'a'];
@@ -717,7 +1490,7 @@ function postCommand(action, extra = {}) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ t: TOKEN, action, ...extra }),
   }).catch(() => {
-    if (!connected && !CAMEO_MODE) speak('It looks like pi is not running. Would you like help starting it?');
+    if (!connected && !CAMEO_MODE) speak(openStatus('pi is not running. Would you like help starting it?'));
   });
 }
 
@@ -793,6 +1566,8 @@ function finishPointer(event) {
   drag = null;
   if (wasDrag) {
     agent?.resume();
+    // Dropped in a screen corner? He would like that noted.
+    noteCorner();
     return;
   }
   // A click (no movement). Pointer capture retargets events, so hit-test
@@ -812,7 +1587,16 @@ function finishPointer(event) {
     postCommand('cameo-click', { agent: AGENT });
     return;
   }
-  // Click on Clippy or anywhere in his window: ask.
+  // Click on Clippy or anywhere in his window. Before it counts as a
+  // question, two gentler readings get first refusal: a very fast second
+  // click is a startle, and three unhurried clicks in a row are petting.
+  const now = Date.now();
+  if (asleep) {
+    wakeUp(true);
+    return;
+  }
+  if (noteStartle(now)) return;
+  if (notePetClick(now)) return;
   postCommand('clippy');
 }
 

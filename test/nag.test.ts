@@ -51,23 +51,37 @@ function main(): void {
   check('isSnoozeLabel case-insensitive', isSnoozeLabel("don't SHOW this tip AGAIN"))
   check('isSnoozeLabel rejects No', !isSnoozeLabel('No'))
 
-  // Nag lines escalate
-  check('nagLine level 1 asks again', nagLine('grading letters', 1).includes('I will ask again'))
-  check('nagLine level 2 keeps asking', nagLine('grading letters', 2).includes('twice'))
-  check('nagLine level 3+ chart', nagLine('grading letters', 5).includes('chart'))
-  check('nagLine empty subject fallback', nagLine('', 1).includes('my earlier offer'))
-  check('nagLine always asks', [1, 2, 3].every(level => nagLine('grading letters', level).includes('Would you like help with it?')))
+  // Nag lines escalate, and each tier is a pool rather than one sentence
+  const ROLLS = [0, 0.34, 0.67, 0.99]
+  check('nagLine level 1 asks again', nagLine('grading letters', 1, 0).includes('I will ask again'))
+  check('nagLine level 2 keeps asking', nagLine('grading letters', 2, 0).includes('twice'))
+  check('nagLine level 3+ keeps records', nagLine('grading letters', 5, 0).includes('chart'))
+  check('nagLine empty subject fallback', nagLine('', 1, 0).includes('my earlier offer'))
+  check('nagLine always asks',
+    [1, 2, 3, 9].every(level => ROLLS.every(roll => nagLine('grading letters', level, roll).includes('Would you like help with it?'))))
+  check('nagLine always names the subject',
+    [1, 2, 3].every(level => ROLLS.every(roll => nagLine('grading letters', level, roll).includes('grading letters'))))
+  check('every tier has more than one way of nagging',
+    [1, 2, 3].every(level => new Set(ROLLS.map(roll => nagLine('grading letters', level, roll))).size > 1))
+  check('the tiers stay distinct from each other',
+    new Set([1, 2, 3].map(level => nagLine('grading letters', level, 0))).size === 3)
+  check('an out-of-range roll still nags', nagLine('grading letters', 1, 7).includes('grading letters'))
 
   // Ignored-offer and snooze lines use the subject
-  check('ignoredOfferLine takes silence as yes', ignoredOfferLine('grading letters').includes('taken that as a yes'))
-  check('ignoredOfferLine empty fallback', ignoredOfferLine('').includes('my earlier offer'))
-  check('snoozeLine files under Do Not Reopen', snoozeLine('grading letters').includes('Do Not Reopen'))
+  check('ignoredOfferLine takes silence as yes', ignoredOfferLine('grading letters', 0).includes('taken that as a yes'))
+  check('ignoredOfferLine empty fallback', ignoredOfferLine('', 0).includes('my earlier offer'))
+  check('ignoredOfferLine varies', new Set(ROLLS.map(roll => ignoredOfferLine('grading letters', roll))).size > 1)
+  check('snoozeLine files under Do Not Reopen',
+    ROLLS.every(roll => snoozeLine('grading letters', roll).includes('Do Not Reopen')))
+  check('snoozeLine varies', new Set(ROLLS.map(roll => snoozeLine('grading letters', roll))).size > 1)
 
   // Dismissed-offer line: the third, annoyed way an unanswered offer ends
   // (distinct from "taken as a yes" and from a silent drop with no balloon)
-  check('dismissedOfferLine decides against it himself', dismissedOfferLine('grading letters').includes('decide that one myself'))
-  check('dismissedOfferLine empty fallback', dismissedOfferLine('').includes('my earlier offer'))
-  check('dismissedOfferLine is distinct from ignoredOfferLine', dismissedOfferLine('grading letters') !== ignoredOfferLine('grading letters'))
+  check('dismissedOfferLine decides against it himself', dismissedOfferLine('grading letters', 0).includes('decide that one myself'))
+  check('dismissedOfferLine empty fallback', dismissedOfferLine('', 0).includes('my earlier offer'))
+  check('dismissedOfferLine varies', new Set(ROLLS.map(roll => dismissedOfferLine('grading letters', roll))).size > 1)
+  check('dismissedOfferLine is never mistaken for taking it as a yes',
+    ROLLS.every(roll => !dismissedOfferLine('grading letters', roll).includes('as a yes')))
 
   // Nag buttons: snooze appears after the second refusal, never duplicated
   check('nagChoices level 1 no snooze', nagChoices(['Yes', 'No'], 1).length === 2)

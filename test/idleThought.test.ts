@@ -137,6 +137,32 @@ async function main(): Promise<void> {
     !gatedParsed.some(p => p.type === 'balloon'),
     gatedParsed.filter(p => p.type === 'balloon').map(p => p.text).join(' | '))
 
+  // --- A turned-off (right-click Shut up) Clippy never summons on his own ---
+  // The whole point of turning Clippy off is that the desktop stops
+  // volunteering things: no chat summons, and no buddy arriving uninvited.
+  const mutedSse = drainSse(`${viewer.origin}/events?t=${token}`, 250)
+  const mutedRun = new ClippyRuntime(fakeCtx(true), {
+    renderer: 'external',
+    viewer,
+    config: { ...defaultClippyConfig(), cameoChance: 1 },
+    idleThinkTimings: timings(),
+    thoughtGenerator: (async () => ({
+      action: 'chat',
+      agent: 'rocky',
+      statement: 'you could use a second opinion, so i am asking rocky to weigh in',
+    })) as ThoughtGenerator,
+  })
+  mutedRun.start()
+  mutedRun.shushAgent('clippy') // the menu's Shut up — turning Clippy off
+  await sleep(150)
+  check('a turned-off Clippy never summons a buddy on its own', !viewer.isCameoOpen('rocky'))
+  mutedRun.dispose()
+  const mutedRaw = await mutedSse
+  const mutedParsed = mutedRaw.map(e => JSON.parse(e) as { type?: string; text?: string })
+  check('a turned-off Clippy stays quiet (no chat opener, no arrival line)',
+    !mutedParsed.some(p => p.type === 'balloon'),
+    mutedParsed.filter(p => p.type === 'balloon').map(p => p.text).join(' | '))
+
   // --- An offer thought shows a balloon with real buttons ------------------
   const offerSse = drainSse(`${viewer.origin}/events?t=${token}`, 250)
   const offerRun = new ClippyRuntime(fakeCtx(true), {

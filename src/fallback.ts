@@ -97,15 +97,31 @@ function updatedFilename(tool: ClippyToolEvidence): string | undefined {
   return basename === undefined || basename === '' ? undefined : basename
 }
 
-function testResult(tool: ClippyToolEvidence): string | undefined {
+/** What a test run actually said, as structure rather than as a sentence.
+ * Kept separate from the wording so the climate, the neutral beat, and the
+ * spoken line all read the same result and only the phrasing varies. */
+interface TestVerdict {
+  readonly outcome: 'passing' | 'failing'
+  /** How many failed, when the output said so. */
+  readonly failed?: string
+}
+
+function testVerdict(tool: ClippyToolEvidence): TestVerdict | undefined {
   if ((waitableLabel(tool) !== 'test run' && !/test/iu.test(tool.name)) || tool.resultExcerpt === undefined) return undefined
   const failed = tool.resultExcerpt.match(/\btests?\s+(\d+)\s+failed\b/iu)?.[1]
     ?? tool.resultExcerpt.match(/\b(\d+)\s+(?:tests?\s+)?failed\b/iu)?.[1]
-  if (failed !== undefined) return `you ran some tests and ${failed} of them failed`
+  if (failed !== undefined) return { outcome: 'failing', failed }
   const passed = tool.resultExcerpt.match(/\btests?\s+(\d+)\s+passed\b/iu)?.[1]
     ?? tool.resultExcerpt.match(/\b(\d+)\s+(?:tests?\s+)?passed\b/iu)?.[1]
-  if (passed !== undefined) return `you ran some tests and they all passed`
+  if (passed !== undefined) return { outcome: 'passing' }
   return undefined
+}
+
+/** One of a pool, by roll. Out-of-range rolls take the first entry, so a
+ * caller that forgets to inject one still gets a sentence. */
+function pick(pool: readonly string[], roll: number): string {
+  if (!Number.isFinite(roll) || roll < 0 || roll >= 1) return pool[0]!
+  return pool[Math.floor(roll * pool.length)] ?? pool[0]!
 }
 
 /** The most recent test outcome the session produced, as a plain verdict.
@@ -115,9 +131,9 @@ export function latestTestOutcome(evidence: ClippyEvidence): 'passing' | 'failin
   for (let index = evidence.recentTools.length - 1; index >= 0; index -= 1) {
     const tool = evidence.recentTools[index]
     if (tool === undefined) continue
-    const verdict = testResult(tool)
+    const verdict = testVerdict(tool)
     if (verdict === undefined) continue
-    return verdict.includes('failed') ? 'failing' : 'passing'
+    return verdict.outcome
   }
   return undefined
 }
@@ -130,9 +146,9 @@ export function latestOperationalBeat(evidence: ClippyEvidence): string | undefi
   const latest = evidence.recentTools.at(-1)
   if (latest === undefined) return undefined
 
-  const tests = testResult(latest)
+  const tests = testVerdict(latest)
   if (tests !== undefined) {
-    return tests.includes('failed')
+    return tests.outcome === 'failing'
       ? 'the last test run reported failures'
       : 'the last test run passed'
   }
@@ -149,18 +165,60 @@ export function latestOperationalBeat(evidence: ClippyEvidence): string | undefi
 /** A model-free, fact-only line from the newest structured operational event,
  * said the way a paperclip would say it: plain and a little confused about
  * what the task actually was. */
-export function operationalFallbackStatement(evidence: ClippyEvidence): string | undefined {
+export function operationalFallbackStatement(evidence: ClippyEvidence, roll: number = Math.random()): string | undefined {
   const latest = evidence.recentTools.at(-1)
   if (latest === undefined) return undefined
 
-  const tests = testResult(latest)
-  if (tests !== undefined) return tests
+  const tests = testVerdict(latest)
+  if (tests?.outcome === 'failing') {
+    const count = tests.failed ?? 'some'
+    return pick([
+      `you ran some tests and ${count} of them failed`,
+      `you had your paperwork graded and ${count} pages came back with red pen on them`,
+      `you sent ${count} letters back for corrections, which happens to everybody`,
+      `your grader has returned ${count} items marked, and I have kept them in order for you`,
+    ], roll)
+  }
+  if (tests?.outcome === 'passing') {
+    return pick([
+      'you ran some tests and they all passed',
+      'you had the whole stack graded and every single letter came back excellent',
+      'your paperwork has been checked and not one page needed correcting',
+      'you passed the lot, which I would like noted in the minutes',
+    ], roll)
+  }
 
   const filename = latest.outcome === 'success' ? updatedFilename(latest) : undefined
-  if (filename !== undefined) return `you updated ${filename} and it is looking very neat`
+  if (filename !== undefined) {
+    return pick([
+      `you updated ${filename} and it is looking very neat`,
+      `you revised ${filename}, and I have refiled it under Recently Improved`,
+      `you have been tidying ${filename}, which I approve of enormously`,
+      `${filename} has been rewritten, and the old draft has been shredded with dignity`,
+    ], roll)
+  }
 
   const label = waitableLabel(latest) ?? toolLabel(latest.name)
-  if (latest.outcome === 'error') return `your ${label} did not work, but that is what erasers are for`
-  if (latest.outcome === 'running') return `your ${label} is still going, which means it is important`
-  return `you just finished a ${label} and I am sure it was excellent`
+  if (latest.outcome === 'error') {
+    return pick([
+      `your ${label} did not work, but that is what erasers are for`,
+      `your ${label} came back wrong, which is simply a typo on a larger scale`,
+      `your ${label} has failed, and I have already begun a memo about it`,
+      `your ${label} refused to cooperate, and I do not blame you for it`,
+    ], roll)
+  }
+  if (latest.outcome === 'running') {
+    return pick([
+      `your ${label} is still going, which means it is important`,
+      `your ${label} has not finished, so I am waiting respectfully`,
+      `your ${label} is taking its time, the way the good ones do`,
+      `your ${label} is still in the machine, and I am watching the little light`,
+    ], roll)
+  }
+  return pick([
+    `you just finished a ${label} and I am sure it was excellent`,
+    `you have completed a ${label}, and I have filed it away for you`,
+    `your ${label} went through without a single complaint`,
+    `you did a ${label}, which is exactly the sort of thing I would have suggested`,
+  ], roll)
 }

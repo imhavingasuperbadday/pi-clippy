@@ -21,7 +21,7 @@
  * - Windows stay open when pi exits; the page reconnects when pi returns and
  *   says so through the dialog box.
  */
-const { app, BrowserWindow, Menu, ipcMain, shell: electronShell } = require('electron')
+const { app, BrowserWindow, Menu, ipcMain, screen, shell: electronShell } = require('electron')
 const path = require('node:path')
 const os = require('node:os')
 
@@ -29,6 +29,14 @@ app.setPath('userData', path.join(os.tmpdir(), 'pi-clippy', 'electron-profile'))
 app.setName('Clippy')
 
 const DEFAULT_FRIENDS = ['bonzi', 'genie', 'merlin', 'rover', 'rocky', 'peedy', 'links']
+
+/** Bumped whenever the shell's menu or behavior changes materially. The
+ * extension passes its copy on the command line; when this process (which
+ * may predate the running pi session, thanks to the single-instance lock)
+ * sees a different one, it relaunches itself with the new code instead of
+ * showing the old menu forever. Keep in lockstep with SHELL_VERSION in
+ * src/viewer.ts. */
+const SHELL_VERSION = 1
 
 /** win -> agent name ('clippy' for the main window). */
 const agentWindows = new Map()
@@ -38,7 +46,8 @@ let settingsPath = null
 function parseArgv(argv) {
   const url = argv.find(arg => arg.startsWith('--url='))?.slice('--url='.length)
   const settings = argv.find(arg => arg.startsWith('--settings='))?.slice('--settings='.length)
-  return { url, settings }
+  const shellVersion = Number(argv.find(arg => arg.startsWith('--shell-version='))?.slice('--shell-version='.length)) || 0
+  return { url, settings, shellVersion }
 }
 
 function openSettings() {
@@ -69,6 +78,12 @@ function activeBuddies(self) {
 
 const CLIPPY_AGENTS = new Set(['bonzi', 'genie', 'merlin', 'rover', 'rocky', 'peedy', 'links', 'clippy'])
 
+/** Which agents are currently shushed, so the menu item can flip in place
+ * to "Let me talk again" with a tick beside it. The renderer tells us when
+ * the toggle lands, and the extension owns the real state — this is only
+ * what the menu draws. */
+const shushedAgents = new Set()
+
 /** Selected reasoning mode for Clippy's model route (DeepSeek v4 Flash et
  * al.) — shared across windows so the radio marks survive menu rebuilds. */
 const REASONING_LEVELS = ['off', 'low', 'medium', 'high']
@@ -88,6 +103,7 @@ function reasoningMenu(win) {
 
 function assistantMenu(agent, win) {
   const label = agent === 'clippy' ? 'Clippy' : agentLabel(agent)
+  const shushed = shushedAgents.has(agent)
   const url = win.webContents.getURL()
   const friends = friendsFromUrl(url).filter(friend => CLIPPY_AGENTS.has(friend) && friend !== agent)
   const turnoffCandidates = activeBuddies(agent)
@@ -107,12 +123,30 @@ function assistantMenu(agent, win) {
     { label: 'Suggest next step', click: () => sendMenuAction(win, 'suggest') },
     { label: 'Roast me', click: () => sendMenuAction(win, 'roast') },
     { label: 'Wave', click: () => sendMenuAction(win, 'wave') },
+    // The whole joke is that you will forget he is muted, so the item flips
+    // in place (same position, ticked) rather than moving or disappearing.
+    shushed
+      ? {
+        label: `Let ${agent === 'clippy' ? 'me' : label} talk again`,
+        type: 'checkbox',
+        checked: true,
+        click: () => sendMenuAction(win, 'unshush'),
+      }
+      : {
+        label: 'Shut up',
+        click: () => sendMenuAction(win, 'shush'),
+      },
+    { label: 'Feed Clippy', click: () => sendMenuAction(win, 'feed') },
     { type: 'separator' },
     {
       label: 'Reasoning mode',
       submenu: reasoningMenu(win),
     },
     { type: 'separator' },
+    {
+      label: 'Hold a board meeting',
+      click: () => sendMenuAction(win, 'meeting'),
+    },
     {
       label: 'Summon a buddy',
       enabled: summonItems.length > 0,
@@ -195,11 +229,24 @@ function createAgentWindow(url, nearWin) {
   })
   win.on('closed', () => {
     agentWindows.delete(win)
+    // The extension un-mutes everyone on session end; the menu forgets a
+    // window's tick when the window itself goes away.
+    shushedAgents.delete(agent)
   })
 
   void win.loadURL(url)
   return win
 }
+
+// The renderer is the source of truth for mute state (it owns the shush
+// broadcast from the extension) and reports every change here — a menu
+// click, a typed "shut up", a brush-off strike, or a timed mute lifting on
+// its own — so the right-click item never drifts from reality.
+ipcMain.on('clippy:shush-state', (_event, agent, shushed) => {
+  if (typeof agent !== 'string') return
+  if (shushed) shushedAgents.add(agent)
+  else shushedAgents.delete(agent)
+})
 
 // IPC is routed to the window that sent it, so each agent window sizes and
 // moves itself.
@@ -208,6 +255,15 @@ ipcMain.handle('clippy:set-bounds', (event, bounds) => {
 })
 ipcMain.handle('clippy:set-position', (event, x, y) => {
   BrowserWindow.fromWebContents(event.sender)?.setPosition(x, y)
+})
+// The sprite leans toward the pointer; the page asks for the point rather
+// than the main process pushing it, so nothing polls when nobody is idle.
+ipcMain.handle('clippy:cursor', () => {
+  try {
+    return screen.getCursorScreenPoint()
+  } catch {
+    return null
+  }
 })
 ipcMain.on('clippy:close', (event) => {
   BrowserWindow.fromWebContents(event.sender)?.close()
@@ -226,9 +282,20 @@ if (!gotLock) {
   // receives them here. Reopening an agent that already has a window just
   // focuses it (no duplicates); new agents open next to Clippy.
   app.on('second-instance', (_event, argv) => {
-    const { url, settings } = parseArgv(argv)
+    const { url, settings, shellVersion } = parseArgv(argv)
     if (url === undefined) return
     if (settings !== undefined) settingsPath = settings
+    // This process holds the single-instance lock, but a shell with a
+    // different version is asking to run — the package was updated and this
+    // window outlived it. Hand the lock over instead of pretending the old
+    // menu is the current one, or right-click changes never reach a running
+    // window. The relaunched process loads the NEW main.cjs, whose version
+    // matches the incoming one, so this can only ever hand over once.
+    if (shellVersion !== SHELL_VERSION) {
+      app.relaunch({ args: argv.slice(1) })
+      app.exit(0)
+      return
+    }
     const agent = agentFromUrl(url)
     const existing = [...agentWindows.entries()].find(([, name]) => name === agent)
     if (existing !== undefined) {

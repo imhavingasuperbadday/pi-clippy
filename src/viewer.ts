@@ -21,7 +21,10 @@
  * loads right after, or on top of, Clippy's. Balloons queue FIFO; the window
  * holding the floor reports `balloon-gone` (POST /command) when its balloon
  * closes or the user answers it, releasing the floor for the next message,
- * with a fallback reading timer as insurance against a dead renderer.
+ * with a fallback reading timer as insurance against a dead renderer. Short
+ * zingers are the one exception: a plain line of a few words may cut the
+ * current speaker's VOICE off mid-sentence (a `voice-stop` event cancels its
+ * speech but keeps its balloon up) and take the floor immediately.
  */
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
@@ -55,6 +58,9 @@ const MAX_COMMAND_BODY = 4_096
 const WINDOW_SIZE = '280,340'
 const DEFAULT_PORT = 8_765
 const CAMEO_READY_TIMEOUT_MS = 20_000
+/** Every open buddy window reports in on this cadence (assets/client.js);
+ * a window that has missed several in a row is gone. */
+const CAMEO_STALE_MS = 75_000
 /** Dedicated profile so --app always opens a standalone Clippy window even
  * when the user's Edge/Chrome is already running (otherwise the app window
  * can silently become a tab in the existing browser). */
@@ -65,6 +71,12 @@ const APP_PROFILE_DIR = join(tmpdir(), 'pi-clippy-browser-profile')
 const STATE_DIR = join(tmpdir(), 'pi-clippy')
 const TOKEN_FILE = join(STATE_DIR, 'token')
 const SHELL_MAIN = join(PACKAGE_ROOT, 'shell', 'main.cjs')
+/** Bumped whenever the shell's menu or behavior changes materially. The
+ * extension passes it on the command line so a stale single-instance shell
+ * (which keeps running old code across pi restarts) can detect that it is
+ * outdated and hand over to a fresh process. Keep in lockstep with
+ * SHELL_VERSION in shell/main.cjs. */
+const SHELL_VERSION = 1
 
 function loadOrCreateToken(): string {
   try {
@@ -95,6 +107,12 @@ export interface ClippyFloorOptions {
   readonly readingMs?: (hasChoices: boolean) => number
   /** A beat of silence after a message clears before the next is voiced. */
   readonly gapMs?: number
+  /** A plain line of at most this many words is a zinger: while ANOTHER
+   * window is voicing a message, a zinger cuts that voice off and takes the
+   * floor immediately instead of waiting its turn. The interrupted window
+   * keeps its balloon up for reading; only its speech is cut. Longer lines
+   * always wait politely. Default: 3. */
+  readonly interruptWordLimit?: number
 }
 
 export interface ClippyViewerOptions {
@@ -132,6 +150,14 @@ export class ClippyViewer {
   private readonly pendingCameoChoices = new Map<string, readonly string[] | undefined>()
   /** Cameo windows currently known to be open (per agent). */
   private readonly activeCameos = new Set<string>()
+  /** When each open buddy window last reported in. A window that dies without
+   * saying so — the shell killed, the machine slept, Electron torn down with
+   * the whole app — used to stay "open" for the rest of the session, which
+   * quietly broke the desktop three ways: that buddy could never be summoned
+   * again, casting kept skipping it as already present, and every line
+   * addressed to it took the floor and stalled the queue until the fallback
+   * reading timer expired. The heartbeat is what makes "open" mean open. */
+  private readonly cameoSeen = new Map<string, number>()
   /** One-message-at-a-time floor queue (balloons waiting to be voiced). */
   private readonly floorQueue: Array<{ payload: string; to: string; hasChoices: boolean }> = []
   /** The fallback reading timer for the balloon currently on the floor. */
@@ -158,6 +184,7 @@ export class ClippyViewer {
       enabled: floor.enabled !== false,
       readingMs: floor.readingMs ?? (hasChoices => (hasChoices ? 36_000 : 12_000)),
       gapMs: floor.gapMs ?? 900,
+      interruptWordLimit: floor.interruptWordLimit ?? 3,
     }
   }
 
@@ -208,7 +235,10 @@ export class ClippyViewer {
     this.server = server
     const address = server.address()
     this.port = typeof address === 'object' && address !== null ? address.port : undefined
-    this.heartbeat = setInterval(() => this.ping(), HEARTBEAT_MS)
+    this.heartbeat = setInterval(() => {
+      this.ping()
+      this.sweepCameos()
+    }, HEARTBEAT_MS)
   }
 
   dispose(): void {
@@ -231,6 +261,7 @@ export class ClippyViewer {
     this.pendingCameos.clear()
     this.pendingCameoChoices.clear()
     this.activeCameos.clear()
+    this.cameoSeen.clear()
     this.lastLines.clear()
     if (this.server !== undefined) {
       this.server.close()
@@ -253,15 +284,18 @@ export class ClippyViewer {
   broadcast(event: string, data: unknown): void {
     const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
     if (event === 'clippy' && typeof data === 'object' && data !== null) {
-      const record = data as { type?: unknown; to?: unknown; text?: unknown }
+      const record = data as { type?: unknown; to?: unknown; text?: unknown; choices?: unknown }
       if (record.type === 'balloon' && typeof record.text === 'string') {
         const to = typeof record.to === 'string' ? record.to : 'clippy'
         this.lastLines.set(to, record.text)
         if (this.floor.enabled) {
           // One message at a time: the balloon waits for the floor instead of
           // being written straight to the renderers, so no two windows are
-          // ever talking at once.
-          this.enqueueBalloon(payload, to, Array.isArray((data as { choices?: unknown }).choices))
+          // ever talking at once — unless it is a short zinger, which cuts
+          // the current speaker's voice off and jumps the queue.
+          if (!this.tryPreempt(payload, to, record.text, Array.isArray(record.choices))) {
+            this.enqueueBalloon(payload, to, Array.isArray((data as { choices?: unknown }).choices))
+          }
           return
         }
       }
@@ -291,6 +325,38 @@ export class ClippyViewer {
   private enqueueBalloon(payload: string, to: string, hasChoices: boolean): void {
     this.floorQueue.push({ payload, to, hasChoices })
     this.drainFloor()
+  }
+
+  /** A short zinger (a few words, no buttons) may cut ANOTHER window's
+   * voice off mid-sentence and take the floor right away instead of waiting
+   * its turn — the "Squawk." that interrupts the wizard's prophecy. The
+   * interrupted window keeps its balloon up for reading; only its speech is
+   * stopped (the renderer gets a voice-stop event). A window never cuts its
+   * OWN message short, and a zinger never jumps messages queued for its own
+   * window, so per-window order always holds. Returns true when the zinger
+   * was delivered immediately. */
+  private tryPreempt(payload: string, to: string, text: string, hasChoices: boolean): boolean {
+    if (hasChoices || this.floorActiveTo === undefined || this.floorActiveTo === to) return false
+    // Nothing actually live on the floor? Nothing to cut — queue politely.
+    if (this.floorTimer === undefined) return false
+    const words = text.trim().split(/\s+/u).filter(Boolean).length
+    if (words > this.floor.interruptWordLimit) return false
+    // Keep the zinger's own window in order: never jump its queued lines.
+    if (this.floorQueue.some(item => item.to === to)) return false
+    // Cut the current speaker's voice off.
+    this.writeAll(`event: clippy\ndata: ${JSON.stringify({ type: 'voice-stop', to: this.floorActiveTo })}\n\n`)
+    // The zinger takes the floor NOW, skipping the queue and the gap.
+    this.floorQueue.unshift({ payload, to, hasChoices })
+    if (this.floorTimer !== undefined) {
+      clearTimeout(this.floorTimer)
+      this.floorTimer = undefined
+    }
+    if (this.floorGapTimer !== undefined) {
+      clearTimeout(this.floorGapTimer)
+      this.floorGapTimer = undefined
+    }
+    this.drainFloor()
+    return true
   }
 
   private drainFloor(): void {
@@ -329,6 +395,27 @@ export class ClippyViewer {
     this.floorRelease()
   }
 
+  /** A lobotomy (src/runtime.ts lobotomize): drop every balloon queued on the
+   * floor and stop whoever is mid-voice, so the reset paperclip's first line
+   * is heard immediately instead of behind a pile of pre-lobotomy chatter.
+   * Open balloons already on screen are left alone — only the queue and the
+   * current speech are cleared. */
+  clearFloor(): void {
+    this.floorQueue.length = 0
+    if (this.floorTimer !== undefined) {
+      clearTimeout(this.floorTimer)
+      this.floorTimer = undefined
+    }
+    if (this.floorGapTimer !== undefined) {
+      clearTimeout(this.floorGapTimer)
+      this.floorGapTimer = undefined
+    }
+    if (this.floorActiveTo !== undefined) {
+      this.writeAll(`event: clippy\ndata: ${JSON.stringify({ type: 'voice-stop', to: this.floorActiveTo })}\n\n`)
+      this.floorActiveTo = undefined
+    }
+  }
+
   /** Deliver a balloon (with optional choice buttons) to a specific cameo
    * window that is already connected. */
   sayTo(agent: string, text: string, choices?: readonly string[]): void {
@@ -360,6 +447,8 @@ export class ClippyViewer {
       return
     }
     this.activeCameos.add(agent)
+    // Not seen yet: the cameo-ready timeout below owns this window until it
+    // announces itself, and only then does the heartbeat take over.
     this.pendingCameos.set(agent, text)
     this.pendingCameoChoices.set(agent, choices)
     const extra: Record<string, string> = { agent, holdMs: String(this.options.holdMs) }
@@ -386,14 +475,45 @@ export class ClippyViewer {
 
   /** Turn off a buddy: its window is asked to close itself. */
   closeCameo(agent: string): void {
-    this.activeCameos.delete(agent)
-    this.pendingCameos.delete(agent)
-    this.pendingCameoChoices.delete(agent)
+    this.dropCameo(agent)
     this.broadcast('clippy', { type: 'close', to: agent })
   }
 
   isCameoOpen(agent: string): boolean {
     return this.activeCameos.has(agent)
+  }
+
+  /** A buddy window said it is still there. */
+  private noteCameoAlive(agent: string): void {
+    if (!this.activeCameos.has(agent)) return
+    this.cameoSeen.set(agent, Date.now())
+  }
+
+  /** Forget buddy windows that stopped reporting in, and unblock anything
+   * that was waiting on them. Runs on the same interval as the SSE ping. */
+  private sweepCameos(): void {
+    const cutoff = Date.now() - CAMEO_STALE_MS
+    for (const agent of [...this.activeCameos]) {
+      // A window that has not yet announced itself is covered by the
+      // cameo-ready timeout, not by this sweep.
+      const seen = this.cameoSeen.get(agent)
+      if (seen === undefined || seen >= cutoff) continue
+      this.dropCameo(agent)
+    }
+  }
+
+  /** Forget one buddy window and release everything it was holding: its
+   * claim on the agent (so it can be summoned again), its queued lines, and
+   * the floor if the departed window was the one speaking. */
+  private dropCameo(agent: string): void {
+    this.activeCameos.delete(agent)
+    this.cameoSeen.delete(agent)
+    this.pendingCameos.delete(agent)
+    this.pendingCameoChoices.delete(agent)
+    for (let index = this.floorQueue.length - 1; index >= 0; index -= 1) {
+      if (this.floorQueue[index]?.to === agent) this.floorQueue.splice(index, 1)
+    }
+    if (this.floorActiveTo === agent) this.floorRelease()
   }
 
   openWindow(): void {
@@ -408,7 +528,7 @@ export class ClippyViewer {
       const electron = this.electronPath()
       if (electron !== undefined) {
         const settingsPath = join(getAgentDir(), 'settings.json')
-        const child = spawn(electron, [SHELL_MAIN, `--url=${url}`, `--settings=${settingsPath}`], {
+        const child = spawn(electron, [SHELL_MAIN, `--url=${url}`, `--settings=${settingsPath}`, `--shell-version=${SHELL_VERSION}`], {
           detached: true,
           stdio: 'ignore',
         })
@@ -524,16 +644,25 @@ export class ClippyViewer {
       const action = typeof record.action === 'string' ? record.action : undefined
       const agent = typeof record.agent === 'string' ? record.agent : undefined
       if (action === 'cameo-ready') {
-        if (agent !== undefined && this.pendingCameos.has(agent)) {
-          this.broadcast('clippy', { type: 'balloon', to: agent, text: this.pendingCameos.get(agent), choices: this.pendingCameoChoices.get(agent) })
-          this.pendingCameos.delete(agent)
-          this.pendingCameoChoices.delete(agent)
+        if (agent !== undefined) {
+          this.noteCameoAlive(agent)
+          if (this.pendingCameos.has(agent)) {
+            this.broadcast('clippy', { type: 'balloon', to: agent, text: this.pendingCameos.get(agent), choices: this.pendingCameoChoices.get(agent) })
+            this.pendingCameos.delete(agent)
+            this.pendingCameoChoices.delete(agent)
+          }
         }
+        return
+      }
+      if (action === 'cameo-alive') {
+        // The open-window heartbeat: this is what keeps a buddy summonable
+        // again after its window dies without a word (see sweepCameos).
+        if (agent !== undefined) this.noteCameoAlive(agent)
         return
       }
       if (action === 'cameo-gone') {
         // A cameo window closed itself; forget it so a future summon reopens it.
-        if (agent !== undefined) this.activeCameos.delete(agent)
+        if (agent !== undefined) this.dropCameo(agent)
         return
       }
       if (action === 'balloon-gone') {

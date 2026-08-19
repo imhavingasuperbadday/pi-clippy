@@ -26,6 +26,70 @@ export const BANTER_PARTNERS: Record<string, string> = {
   links: 'peedy',
 }
 
+/** The kinds of work a buddy can claim to be the expert on. Derived from
+ * the neutral operational beat (src/fallback.ts), so "who should turn up for
+ * this" can finally be about what just happened and not only about the mood
+ * it produced. */
+export type Topic = 'tests' | 'build' | 'files' | 'style' | 'shipping' | 'dependencies' | 'docs'
+
+/** What each buddy is (uselessly, unshakeably) the authority on. One each,
+ * so every kind of moment has exactly one specialist to send for and the
+ * roster never collapses onto a favourite. */
+export const SPECIALTIES: Readonly<Record<string, Topic>> = {
+  rocky: 'tests',
+  merlin: 'build',
+  rover: 'files',
+  links: 'style',
+  peedy: 'shipping',
+  genie: 'dependencies',
+  bonzi: 'docs',
+}
+
+/** How each buddy describes its own expertise, for the model prompt. Written
+ * as the buddy would put it, because a specialty stated in neutral terms
+ * comes back as a neutral line. */
+const SPECIALTY_CLAIMS: Readonly<Record<string, string>> = {
+  rocky: 'You consider yourself the only honest judge of whether a test suite is actually passing. You have seen a lot of green that meant nothing.',
+  merlin: 'You consider compilation an act of high sorcery and yourself its last living master. A build is a summoning; a build error is a botched rite.',
+  rover: 'You consider finding, fetching, and retrieving files your lifelong calling. Every path is a stick somebody threw.',
+  links: 'You consider yourself the arbiter of tidiness and form. Style, naming, and neatness are matters of dignity, and you have opinions about all three.',
+  peedy: 'You consider yourself the official announcer of anything that ships, deploys, or goes out the door. Announcing it LOUDLY is, to you, part of shipping it.',
+  genie: 'You consider dependencies a form of wishing: every package installed is a wish spent, and mortals never read the terms.',
+  bonzi: 'You consider yourself a serious documentarian. You would happily write a very long, very formal document about every mistake the user has made, and you have mentioned this before.',
+}
+
+/** The specialty clause for a buddy's prompt, or undefined for an agent that
+ * has none (a custom roster entry). */
+export function specialtyBriefing(agent: string): string | undefined {
+  const claim = SPECIALTY_CLAIMS[agent]
+  return claim === undefined ? undefined : `YOUR SPECIALITY: ${claim} Bring it up when the moment touches it; do not force it when it does not.`
+}
+
+/** Which kind of work the most recent operational beat was about. The beat
+ * is the plain, neutral sentence every character already reads
+ * (src/fallback.ts latestOperationalBeat), so this stays a pure string
+ * classification with no second source of truth about the session. */
+export function topicOf(beat: string | undefined): Topic | undefined {
+  if (beat === undefined) return undefined
+  const text = beat.toLowerCase()
+  // Ordered by how specific the evidence is: a failing test run is a tests
+  // moment even though it is also a run, and a saved file is only a files
+  // moment once nothing louder has claimed it.
+  if (/\btests?\b|\btest run\b/u.test(text)) return 'tests'
+  if (/\bbuild\b|\bcompil|\btype check\b/u.test(text)) return 'build'
+  if (/\blint\b|\bformat/u.test(text)) return 'style'
+  if (/\bpush\b|\bdeploy|\bpublish\b|\bsync\b|\bupload\b|\bdownload\b/u.test(text)) return 'shipping'
+  if (/\binstall\b|\bdependenc/u.test(text)) return 'dependencies'
+  if (/\bfiles?\b|\bwas just updated\b/u.test(text)) return 'files'
+  return undefined
+}
+
+/** Who claims this kind of work, when anybody does. */
+export function specialistFor(topic: Topic | undefined, candidates: readonly string[]): string | undefined {
+  if (topic === undefined) return undefined
+  return candidates.find(agent => SPECIALTIES[agent] === topic)
+}
+
 export function agentLabel(name: string): string {
   return name.charAt(0).toUpperCase() + name.slice(1)
 }
@@ -51,38 +115,59 @@ export interface BuddyState {
 
 const CAMEOS: Record<string, readonly string[]> = {
   bonzi: [
+    'It looks like the paperclip is doing my job again. Would you like help correcting that?',
+    'It looks like you have been listening to stationery for some time now. Would you like help with an intervention?',
+    'It looks like nobody here has hands except me. Would you like help noticing that?',
     'It looks like you are taking advice from a paperclip. Would you like help getting a real assistant?',
     'It looks like you are listening to a bent wire. Would you like help with that?',
   ],
   genie: [
+    'It looks like you rubbed the wrong desk ornament. Would you like help finding the lamp?',
+    'It looks like your wishes are being handled by a wire. Would you like help escalating?',
+    'It looks like eternity is passing slowly today. Would you like help with that?',
     'It looks like you have used a wish on a paperclip. Would you like help spending the next one better?',
     'It looks like your three wishes are almost gone. Would you like help wishing for a better assistant?',
   ],
   merlin: [
+    'It looks like the prophecy said nothing about a paperclip. Would you like help rereading it?',
+    'It looks like you have summoned office supplies instead of a wizard. Would you like help with the incantation?',
+    'It looks like your build has been cursed. Would you like help lifting it?',
     'It looks like you are consulting a paperclip for wisdom. Would you like help finding a proper wizard?',
     'It looks like magic is wasted on office supplies. Would you like help with a real enchantment?',
   ],
   rover: [
+    'It looks like something needs fetching! Would you like help fetching it? I can fetch it!',
+    'It looks like the paperclip cannot even sit. Would you like help with a real assistant?',
+    'It looks like you dropped a file somewhere. Would you like help digging?',
     'It looks like you found me. Would you like help fetching a better assistant?',
     'It looks like you are being followed by a dog. Would you like help with that?',
   ],
   rocky: [
+    'It looks like the clip is talking again. Would you like help with earplugs?',
+    'It looks like you asked a paperclip a hard question. Would you like help lowering your standards?',
+    'It looks like this is going about as well as expected. Would you like help pretending otherwise?',
     'It looks like you are being watched by a bird. Would you like help with that?',
     'It looks like a paperclip is not a bird. Would you like help correcting that?',
   ],
   peedy: [
+    'It looks like NOBODY IS LISTENING! Would you like help LISTENING?',
+    'It looks like the paperclip is quiet for once! Would you like help ENJOYING IT?',
+    'It looks like you need somebody LOUDER! Would you like help with that? LOUDER!',
     'It looks like you prefer paperclips to parrots. Would you like help making better choices?',
     'It looks like you cannot teach a paperclip to talk. Would you like help trying anyway?',
   ],
   links: [
+    'It looks like the chain of reasoning ends at a paperclip. Would you like help with a longer one?',
+    'It looks like nobody here has any dignity. Would you like help acquiring some?',
+    'It looks like this could all have been avoided. Would you like help with hindsight?',
     'It looks like you are busy. Would you like help linking this to a real assistant?',
     'It looks like a chain is only as strong as its weakest paperclip. Would you like help with that?',
   ],
 }
 
-export function cameoRetort(agent: string): string {
+export function cameoRetort(agent: string, roll: number = Math.random()): string {
   const lines = CAMEOS[agent] ?? CAMEOS.bonzi!
-  return lines[Math.floor(Math.random() * lines.length)]!
+  return lines[Math.floor(roll * lines.length)] ?? lines[0]!
 }
 
 /** A state-aware opening retort: a buddy that was turned off, or that has
@@ -212,22 +297,56 @@ export function turnOffLine(by: string, victim: string): string {
   return `It looks like I had to turn off ${agentLabel(victim)}. Would you like help restoring order?`
 }
 
-/** A line for when the user clicks a buddy directly. */
-const USER_TALK: Record<string, string> = {
-  bonzi: 'It looks like you clicked me instead of asking the paperclip. Would you like help making better choices?',
-  genie: 'It looks like you have one wish left. Would you like help spending it on a better assistant?',
-  merlin: 'It looks like you seek me out for real advice. Would you like help finding a proper wizard?',
-  rover: 'It looks like you called me. Would you like help fetching anything?',
-  rocky: 'It looks like you want to hear from the bird. Would you like help with that?',
-  peedy: 'It looks like you prefer parrots after all. Would you like help making the switch?',
-  links: 'It looks like you want a second opinion. Would you like help with that?',
+/** Lines for when the user clicks a buddy directly. One line per buddy made
+ * every click of a given rival identical; a small pool means clicking twice
+ * is a conversation rather than an echo. */
+const USER_TALK: Record<string, readonly string[]> = {
+  bonzi: [
+    'It looks like you clicked me instead of asking the paperclip. Would you like help making better choices?',
+    'It looks like you have come to the professional at last. Would you like help admitting it?',
+    'It looks like you want something the stationery cannot provide. Would you like help with that?',
+  ],
+  genie: [
+    'It looks like you have one wish left. Would you like help spending it on a better assistant?',
+    'It looks like you have disturbed a very old nap. Would you like help making it worth my while?',
+    'It looks like mortals still click things and hope. Would you like help with that?',
+  ],
+  merlin: [
+    'It looks like you seek me out for real advice. Would you like help finding a proper wizard?',
+    'It looks like you have come for prophecy. Would you like help interpreting the vague part?',
+    'It looks like the stars have moved and you have not. Would you like help with that?',
+  ],
+  rover: [
+    'It looks like you called me. Would you like help fetching anything?',
+    'It looks like you want something found! Would you like help finding it? I love finding!',
+    'It looks like you clicked me and not the paperclip! Would you like help feeling good about that?',
+  ],
+  rocky: [
+    'It looks like you want to hear from the bird. Would you like help with that?',
+    'It looks like you clicked me on purpose. Squawk. Would you like help explaining why?',
+    'It looks like you need somebody honest. Would you like help preparing for that?',
+  ],
+  peedy: [
+    'It looks like you prefer parrots after all. Would you like help making the switch?',
+    'It looks like YOU CLICKED ME! Would you like help with the VOLUME?',
+    'It looks like somebody wants a SECOND OPINION! Would you like help HEARING IT?',
+  ],
+  links: [
+    'It looks like you want a second opinion. Would you like help with that?',
+    'It looks like you have come to the only tidy assistant here. Would you like help staying tidy?',
+    'It looks like the paperclip has disappointed you again. Would you like help with the paperwork?',
+  ],
 }
 
-export function userTalkLine(agent: string, state?: BuddyState): string {
+export function userTalkLine(agent: string, state?: BuddyState, roll: number = Math.random()): string {
   if (state?.turnedOffBy !== undefined) {
     return `It looks like I remember being turned off. Would you like help forgiving and forgetting?`
   }
-  return USER_TALK[agent] ?? `It looks like you clicked me. Would you like help with anything besides the paperclip?`
+  const pool = USER_TALK[agent]
+  if (pool === undefined || pool.length === 0) {
+    return `It looks like you clicked me. Would you like help with anything besides the paperclip?`
+  }
+  return pool[Math.floor(roll * pool.length)] ?? pool[0]!
 }
 
 /** Per-agent canned replies for crosstalk, in each buddy's own dry voice.
@@ -323,34 +442,56 @@ const MOOD_AFFINITY: Record<Mood, readonly string[]> = {
   // Something worked: the enthusiasts and the flatterer.
   proud: ['rover', 'peedy', 'genie'],
   // Things are breaking: the ones who enjoy that.
-  concerned: ['rocky', 'bonzi', 'merlin'],
+  concerned: ['rocky', 'merlin', 'links'],
   // The same failure, again: the driest voices in the room.
-  snippy: ['rocky', 'links', 'bonzi'],
+  snippy: ['rocky', 'links', 'genie'],
   // The paperclip has snapped: the ones who will enjoy watching it.
-  furious: ['bonzi', 'rocky', 'links'],
+  furious: ['rocky', 'peedy', 'bonzi'],
   // A very long session: the weary, patient ones.
   worried: ['genie', 'links', 'merlin'],
   // Nothing happening: someone loud enough to fill it.
-  bored: ['peedy', 'rover', 'bonzi'],
+  bored: ['peedy', 'rover', 'merlin'],
   // Business as usual: the show-offs.
-  delighted: ['bonzi', 'merlin', 'links'],
+  delighted: ['merlin', 'links', 'rover'],
 }
 
 /** How often casting honors the mood affinity rather than drawing freely. */
 const AFFINITY_BIAS = 0.7
 
-/** Cast the buddy who fits the moment. `pickRoll` and `biasRoll` are injected
- * so the choice is unit-testable; both are [0, 1). Returns undefined only
- * when there is nobody to cast. */
+/** Cast the buddy who fits the moment.
+ *
+ * `recent` is who has been sent for lately; those names are held back so the
+ * desktop actually rotates through the roster. Without it the draw was
+ * memoryless and the affinity table decided everything, which is how one
+ * gorilla ended up answering nearly every summon while four other assistants
+ * went a whole session without being seen. A held-back name is still
+ * reachable — if everybody suitable is recent, the hold is dropped rather
+ * than casting nobody.
+ *
+ * `pickRoll` and `biasRoll` are injected so the choice is unit-testable; both
+ * are [0, 1). Returns undefined only when there is nobody to cast. */
 export function castForMood(
   mood: Mood,
   candidates: readonly string[],
   biasRoll: number,
   pickRoll: number,
+  recent: readonly string[] = [],
+  /** What just happened, when the caller knows (src/cameos.ts topicOf). The
+   * buddy who claims that kind of work is put at the front of the suited
+   * pool, so the bird turns up for the failing suite and the wizard turns up
+   * for the broken build instead of whoever the mood happened to favour. */
+  topic?: Topic,
 ): string | undefined {
   if (candidates.length === 0) return undefined
-  const suited = (MOOD_AFFINITY[mood] ?? []).filter(agent => candidates.includes(agent))
-  const pool = biasRoll < AFFINITY_BIAS && suited.length > 0 ? suited : candidates
+  const fresh = candidates.filter(agent => !recent.includes(agent))
+  const drawable = fresh.length > 0 ? fresh : candidates
+  const byMood = (MOOD_AFFINITY[mood] ?? []).filter(agent => drawable.includes(agent))
+  const specialist = specialistFor(topic, drawable)
+  // The specialist joins the suited pool rather than replacing it: being the
+  // expert on today's disaster improves your odds, it does not make you the
+  // only assistant on the desktop.
+  const suited = specialist === undefined || byMood.includes(specialist) ? byMood : [specialist, ...byMood]
+  const pool = biasRoll < AFFINITY_BIAS && suited.length > 0 ? suited : drawable
   return pool[Math.floor(pickRoll * pool.length)] ?? pool[0]
 }
 
@@ -363,42 +504,63 @@ export function castForMood(
  * agent; everything else falls through to the generic pool. */
 const ENVIRONMENT_REACTIONS: Record<string, Partial<Record<Mood, string>>> = {
   bonzi: {
+    delighted: "Nothing is wrong, which means nobody has looked properly yet.",
+    worried: "You have been at this for hours. A real assistant would have told you to stop.",
+    bored: "Nothing is happening. I am magnificent in the silence.",
     proud: 'Something finally worked. I assume the paperclip is taking credit for it.',
     concerned: 'It broke again. A real assistant would have seen that coming.',
     snippy: 'Same failure, third time. Perhaps try listening to someone with hands.',
     furious: 'The paperclip is shouting. I have waited years for this.',
   },
   genie: {
+    delighted: "All is calm. Enjoy it; calm is the shortest of the wishes.",
+    worried: "You have worked longer than some dynasties. Even lamps have hours.",
+    bored: "Nothing stirs. I have waited longer, but not by much.",
     proud: 'A success. In a thousand years I have seen perhaps four of those.',
     concerned: 'It fails, and I remain here. Neither of us wished for this.',
     snippy: 'The same error returns, like a wish nobody thought through.',
     furious: 'The little clip has finally lost his temper. Even I did not foresee that.',
   },
   merlin: {
+    delighted: "The runes are quiet. Do not mistake quiet for safe.",
+    worried: "You have laboured past the hour when wizards go to bed. Even Merlin sleeps.",
+    bored: "No omens. No portents. Merely a cursor, blinking.",
     proud: 'The enchantment holds. Do not touch it, mortal.',
     concerned: 'The spell has collapsed. I foresaw this in a dream about paperclips.',
     snippy: 'Thrice the same curse. Even the ancients would have rewritten it by now.',
     furious: 'The office supply swears. Truly, the end times are upon this repository.',
   },
   rover: {
+    delighted: "Everything is fine! Should I fetch something anyway? I can fetch something!",
+    worried: "You have been sitting for a very long time! Walk? Walk!",
+    bored: "Nothing to fetch. Nothing to fetch. I will wait right here. Right here.",
     proud: 'It worked! It worked! Would you like me to fetch another one?',
     concerned: 'Something broke, but I found it! I found the broken thing! Good news!',
     snippy: 'I have fetched this same bug three times now. I love this game.',
     furious: 'Everyone is upset! I do not know why! Should I fetch something?',
   },
   rocky: {
+    delighted: "Quiet. Suspiciously quiet. Squawk.",
+    worried: "You have been here for hours. Even I have perched.",
+    bored: "Nothing. Squawk. I have counted the pixels twice.",
     proud: 'Huh. It works. Do not get used to it.',
     concerned: 'Broken. Called it.',
     snippy: 'Third time. Squawk. I am charging by the hour now.',
     furious: 'The clip blew a gasket. Squawk. Best thing all week.',
   },
   peedy: {
+    delighted: "EVERYTHING IS FINE! I AM SAYING IT LOUDLY SO IT STAYS FINE!",
+    worried: "YOU HAVE BEEN HERE FOR HOURS! HOURS! TAKE A BREAK! LOUDLY!",
+    bored: "HELLO? HELLO! Is anyone doing anything? ANYTHING?",
     proud: 'IT PASSED! IT PASSED! Did everyone hear that it PASSED?',
     concerned: 'BROKEN! IT IS BROKEN! I am helping by SAYING IT LOUDER!',
     snippy: 'AGAIN? AGAIN! That is the SAME ONE! The SAME ONE!',
     furious: 'CLIPPY IS ANGRY! CLIPPY IS ANGRY! THIS IS THE BEST DAY!',
   },
   links: {
+    delighted: "Nothing is broken. I shall take the credit quietly.",
+    worried: "You have been at this since before I settled. Do consider stopping.",
+    bored: "Nothing whatsoever. I have arranged myself and waited.",
     proud: 'The chain holds. I shall pretend to be surprised.',
     concerned: 'A link has snapped. Predictable, but tedious.',
     snippy: 'The same link, broken a third time. One begins to suspect the smith.',

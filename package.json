@@ -12,7 +12,7 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "test": "npm run typecheck && npm run test:unit",
-    "test:unit": "tsx test/actions.test.ts && tsx test/files.test.ts && tsx test/temper.test.ts && tsx test/viewer.test.ts && tsx test/runtime.test.ts && tsx test/buddy.test.ts && tsx test/floor.test.ts && tsx test/crosstalk.test.ts && tsx test/nag.test.ts && tsx test/mood.test.ts && tsx test/seasons.test.ts && tsx test/stats.test.ts && tsx test/cameos.test.ts && tsx test/idleThought.test.ts",
+    "test:unit": "tsx test/actions.test.ts && tsx test/request.test.ts && tsx test/files.test.ts && tsx test/temper.test.ts && tsx test/viewer.test.ts && tsx test/runtime.test.ts && tsx test/buddy.test.ts && tsx test/floor.test.ts && tsx test/crosstalk.test.ts && tsx test/nag.test.ts && tsx test/mood.test.ts && tsx test/rapport.test.ts && tsx test/fallback.test.ts && tsx test/seasons.test.ts && tsx test/stats.test.ts && tsx test/cameos.test.ts && tsx test/idleThought.test.ts && tsx test/flavor.test.ts && tsx test/eggs.test.ts && tsx test/shush.test.ts && tsx test/office.test.ts && tsx test/secrets.test.ts && tsx test/typos.test.ts && tsx test/games.test.ts && tsx test/boredom.test.ts && tsx test/hats.test.ts && tsx test/antics.test.ts && tsx test/memo.test.ts && tsx test/destiny.test.ts && tsx test/settings.test.ts",
     "probe": "tsx scripts/repro-drift.ts"
   },
   "pi": {

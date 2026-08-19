@@ -16,8 +16,8 @@
  * Pure and unit-tested (test/actions.test.ts): nothing here speaks,
  * schedules, or generates.
  */
-import { REFUSAL_LABEL } from './response.ts'
-import { isSnoozeLabel, offerSubjectOf, subjectOf } from './nag.ts'
+import { MAX_REQUEST_CHARS, REFUSAL_LABEL } from './response.ts'
+import { isSnoozeLabel, offerClauseOf, offerSubjectOf, subjectOf } from './nag.ts'
 
 export type ChoiceEffect =
   /** Take the offer: a real request lands in the pi session. */
@@ -54,10 +54,24 @@ const EFFECT_PATTERNS: ReadonlyArray<readonly [ChoiceEffect, RegExp]> = [
 /** The rival assistants a "second opinion" label may name outright. */
 const NAMED_AGENTS = ['bonzi', 'genie', 'merlin', 'rover', 'rocky', 'peedy', 'links'] as const
 
+/** The button on a balloon that carries a drafted request: pressing it sends
+ * the exact text the user just read into the pi session. The label says so
+ * plainly, because that is the whole contract — the user consented to the
+ * words in front of them, not to an intention behind them. */
+export const SEND_LABEL = 'Send it to pi'
+export const SEND_CHOICES: readonly string[] = [SEND_LABEL, 'Not now'] as const
+
+/** Is this the send button? Checked before the pattern table so no future
+ * wording rule can quietly re-point the one button that talks to pi. */
+export function isSendLabel(label: string): boolean {
+  return label.trim().toLowerCase() === SEND_LABEL.toLowerCase()
+}
+
 /** What this button means. Derived purely from the words on it. */
 export function effectForLabel(label: string): ChoiceEffect {
   const text = label.trim()
   if (text === '') return 'accept'
+  if (isSendLabel(text)) return 'accept'
   if (isSnoozeLabel(text)) return 'snooze'
   if (REFUSAL_LABEL.test(text)) return 'refuse'
   for (const [effect, pattern] of EFFECT_PATTERNS) {
@@ -82,15 +96,26 @@ export function isAcceptance(effect: ChoiceEffect): boolean {
 
 /** The request a click actually delivers into the pi session.
  *
- * Built entirely from what was on screen: the balloon Clippy showed and the
- * button the user pressed. Nothing the model wrote in private, and nothing
- * from the session evidence, can steer this — the user is asking for the
- * thing they just read.
+ * Built entirely from what was on screen: the balloon the assistant showed
+ * and the button the user pressed. Nothing the model wrote in private, and
+ * nothing from the session evidence, can steer this — the user is asking for
+ * the thing they just read.
+ *
+ * The OFFER leads, not the situation. A balloon reads "<situation>. Would you
+ * like help <offer>?", and it is the offer half that names the work; sending
+ * only the situation ("help me with tests are failing") produced a vague
+ * restatement of what the agent already knew, which is exactly why the yes
+ * button used to land with no impact. The situation rides along behind it as
+ * context when there is one.
  */
 export function acceptanceMessage(balloonText: string, label: string): string {
+  const offer = offerClauseOf(balloonText)
   const subject = subjectOf(offerSubjectOf(balloonText)).trim()
-  if (subject === '') return label
-  return `${label} — help me with ${subject}.`
+  const request = offer !== undefined
+    ? (subject === '' ? `Please help me with ${offer}.` : `Please help me with ${offer} — ${subject}.`)
+    : (subject === '' ? '' : `Please help me with ${subject}.`)
+  if (request === '') return label
+  return request.length > MAX_REQUEST_CHARS ? `${request.slice(0, MAX_REQUEST_CHARS - 1).trimEnd()}…` : request
 }
 
 /** A short human name for an effect, for the little "I am doing it" line. */

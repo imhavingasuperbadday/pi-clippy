@@ -19,6 +19,8 @@ function check(name: string, ok: boolean, detail = ''): void {
 function climate(overrides: Partial<SessionClimate>): SessionClimate {
   return {
     mood: 'delighted',
+    intensity: 0.3,
+    trend: 'steady',
     beat: undefined,
     errorStreak: 0,
     repeatCount: 0,

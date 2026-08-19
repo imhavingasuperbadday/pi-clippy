@@ -16,6 +16,7 @@
 import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path'
 import { Type, type Tool } from '@earendil-works/pi-ai'
+import { withinScope } from './destiny.ts'
 
 export class ClippyFileError extends Error {}
 
@@ -41,6 +42,12 @@ const SECRET_NAME = /(?:secret|credential|password|api[_-]?key|token)/iu
 export interface FilePowers {
   readonly read: boolean
   readonly edit: boolean
+  /** When present, edits are additionally confined to these project-relative
+   * paths — the second, independent gate on Clippy's background goal work
+   * (src/destiny.ts). Reads are unaffected: reading is a power he already
+   * has everywhere, and a goal he cannot read around is a goal he cannot do.
+   * Absent means "no extra narrowing", never "anything goes". */
+  readonly editScope?: readonly string[]
 }
 
 export const NO_FILE_POWERS: FilePowers = { read: false, edit: false }
@@ -138,10 +145,23 @@ export interface EditOutcome {
 
 /** Apply one exact-text edit inside the project. `oldText` must match
  * exactly ONCE in the file (a few lines of context make that reliable);
- * an empty `oldText` with new text creates a fresh file. */
-export function editProjectFile(root: string, raw: unknown, oldText: unknown, newText: unknown): EditOutcome {
+ * an empty `oldText` with new text creates a fresh file.
+ *
+ * `editScope`, when given, narrows the edit further to a short list of
+ * project-relative paths. Containment in the project is checked first and
+ * always; the scope is an extra fence on top of it, never a replacement. */
+export function editProjectFile(
+  root: string,
+  raw: unknown,
+  oldText: unknown,
+  newText: unknown,
+  editScope?: readonly string[],
+): EditOutcome {
   const path = resolveProjectPath(root, raw)
   ensureNotSecret(path)
+  if (editScope !== undefined && !withinScope(relative(realpathSync(root), path), editScope)) {
+    throw new ClippyFileError(`that file is outside what I am allowed to work on (${editScope.join(', ')})`)
+  }
   const search = typeof oldText === 'string' ? oldText : ''
   const replacement = typeof newText === 'string' ? newText : ''
   if (search.length > MAX_OLD_TEXT_CHARS) throw new ClippyFileError('the text to replace is too long')
@@ -226,7 +246,12 @@ export interface ToolOutcome {
 /** Execute one tool call from the model. Only the two file tools exist;
  * anything else fails loudly so the model learns the boundaries. This is
  * the single choke point every file operation passes through. */
-export function executeFileTool(root: string, name: string, args: Record<string, unknown>): ToolOutcome {
+export function executeFileTool(
+  root: string,
+  name: string,
+  args: Record<string, unknown>,
+  editScope?: readonly string[],
+): ToolOutcome {
   try {
     if (name === 'read_file') {
       const outcome = readProjectFile(root, args.path, args.startLine, args.lineCount)
@@ -238,7 +263,7 @@ export function executeFileTool(root: string, name: string, args: Record<string,
       }
     }
     if (name === 'edit_file') {
-      const outcome = editProjectFile(root, args.path, args.oldText, args.newText)
+      const outcome = editProjectFile(root, args.path, args.oldText, args.newText, editScope)
       return {
         ok: true,
         action: { kind: 'edit', path: outcome.path, detail: outcome.created ? 'created' : 'edited' },

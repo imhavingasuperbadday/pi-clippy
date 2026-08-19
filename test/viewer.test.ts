@@ -165,6 +165,26 @@ async function main(): Promise<void> {
     JSON.stringify(reasoningExtra),
   )
 
+  // --- A buddy window that goes away really goes away ----------------------
+  // An agent the viewer still believes is on screen can never be summoned
+  // again, is skipped by casting as "already here", and stalls the message
+  // floor every time somebody addresses it — which is how a desktop ends up
+  // with one rival and no way to reach any of the others.
+  const token = new URL(viewer.url).searchParams.get('t')
+  viewer.showCameo('rocky', 'Squawk.', true)
+  check('a summoned buddy counts as open', viewer.isCameoOpen('rocky'))
+  await httpPost(`${viewer.origin}/command`, { t: token, action: 'cameo-gone', agent: 'rocky' })
+  await new Promise(r => setTimeout(r, 100))
+  check('a departed buddy stops counting as open', !viewer.isCameoOpen('rocky'))
+  viewer.showCameo('rocky', 'Squawk. Again.', true)
+  check('a departed buddy can be summoned again', viewer.isCameoOpen('rocky'))
+  await httpPost(`${viewer.origin}/command`, { t: token, action: 'cameo-gone', agent: 'rocky' })
+  await new Promise(r => setTimeout(r, 100))
+  // The liveness report keeps a live window alive without reopening a dead one.
+  const alive = await httpPost(`${viewer.origin}/command`, { t: token, action: 'cameo-alive', agent: 'rocky' })
+  check('a heartbeat from a closed window is harmless',
+    alive === 204 && !viewer.isCameoOpen('rocky'), `status=${alive}`)
+
   viewer.dispose()
   const closed = await httpGet(`${viewer.origin}/`).then(() => 'open', () => 'closed')
   check('dispose closes server', closed === 'closed', closed)

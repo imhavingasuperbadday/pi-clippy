@@ -193,6 +193,13 @@ const HOLIDAY_RULES: readonly HolidayRule[] = [
     matches: date => on(date, 1, 29),
   },
   {
+    id: 'pi-day',
+    name: 'Pi Day',
+    statement: 'you are calculating the circumference of your coffee mug',
+    offers: ['setting this out in a table to three decimal places', 'drafting a memo about circles', 'organizing a pie chart, which is the correct chart today'],
+    matches: date => on(date, 2, 14),
+  },
+  {
     id: 'st-patricks',
     name: "St. Patrick's Day",
     statement: 'you are hoping for a bit of luck with this document',
@@ -230,6 +237,13 @@ const HOLIDAY_RULES: readonly HolidayRule[] = [
     statement: 'you are working when you could be writing a card',
     offers: ['writing a card for your mother', 'drafting a heartfelt letter', 'making a table reservation list'],
     matches: date => date.getDate() === nthWeekdayOfMonth(date.getFullYear(), 4, 0, 2) && date.getMonth() === 4,
+  },
+  {
+    id: 'may-the-fourth',
+    name: 'the fourth of May',
+    statement: 'you are using the Force, which I believe is a kind of macro',
+    offers: ['drafting a memo to the Empire', 'organizing a rebellion in a spreadsheet', 'printing some very serious letterhead'],
+    matches: date => on(date, 4, 4),
   },
   {
     id: 'memorial-day',
@@ -354,4 +368,32 @@ export function seasonalBriefing(occasion: Occasion): string | undefined {
   return occasion.holiday === undefined
     ? undefined
     : `Today is ${occasion.holiday.name}. You may work that in, in your own voice, if it is funny.`
+}
+
+// --- The New Year countdown ------------------------------------------------
+
+/** How many seconds he counts down from. Thirty is long enough to be an
+ * event and short enough to fit in one balloon. */
+export const COUNTDOWN_SECONDS = 30
+
+/** Milliseconds until the countdown should begin (23:59:30 on 31 December,
+ * local time), or undefined when that moment is not within `withinMs`.
+ *
+ * A session that is open at the turn of the year is rare, which is the
+ * whole charm — but it also means nothing may arm a timer months ahead, so
+ * the runtime asks this question periodically and only arms when the answer
+ * is close. A moment that has already passed returns undefined. */
+export function msUntilCountdown(now = new Date(), withinMs = 3_600_000): number | undefined {
+  const target = new Date(now.getFullYear(), 11, 31, 23, 59, 60 - COUNTDOWN_SECONDS, 0)
+  const delta = target.getTime() - now.getTime()
+  if (delta < 0 || delta > withinMs) return undefined
+  return delta
+}
+
+/** The single balloon that counts the year out. One line, not thirty: the
+ * floor serializes balloons, so thirty of them would still be arriving in
+ * February. */
+export function countdownLine(year: number): string {
+  const numbers = [30, 20, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1].join('... ')
+  return `${numbers}... Happy new year. It looks like you are starting ${year + 1} exactly as you finished ${year}. Would you like help with that?`
 }

@@ -35,8 +35,23 @@ export type Mood =
 
 export const MOODS: readonly Mood[] = ['delighted', 'proud', 'concerned', 'snippy', 'furious', 'worried', 'bored'] as const
 
+/** Which way the room is going, independent of where it currently is. The
+ * mood says "things are failing"; the trend says whether they are failing
+ * less than they were ten tool calls ago. A paperclip who cannot tell a
+ * recovery from a collapse is reading half the room. */
+export type ClimateTrend = 'improving' | 'steady' | 'worsening'
+
 export interface SessionClimate {
   readonly mood: Mood
+  /** How strongly the mood is felt, in [0, 1]. The mood is a category; this
+   * is the volume knob on it — the difference between two failures in a row
+   * and a session that has failed nine times without pause. Everything that
+   * used to treat "concerned" as one flat value (the prompt directive, the
+   * mood ring) can now say how concerned. */
+  readonly intensity: number
+  /** Whether the tail of the session is going better or worse than the
+   * stretch before it. */
+  readonly trend: ClimateTrend
   /** One concrete, neutral fact about the most recent operational event
    * ("the last test run reported failures"), or undefined when the session
    * has not done anything yet. Grounds a line in something real. */
@@ -113,6 +128,60 @@ export function trailingErrorStreak(evidence: ClippyEvidence): number {
   return streak
 }
 
+/** How many finished tool results are enough to compare a "before" and an
+ * "after" at all. Below this, a trend would be one unlucky call. */
+const TREND_MIN_SAMPLES = 4
+
+/** Which way the session is going: the failure rate over the tail, against
+ * the failure rate over the stretch before it. Pure, and deliberately
+ * coarse — the point is "recovering" versus "coming apart", not a gradient.
+ * Running calls are skipped: an unfinished command is not yet evidence of
+ * anything. */
+export function climateTrend(evidence: ClippyEvidence): ClimateTrend {
+  const finished = evidence.recentTools.filter(tool => tool.outcome !== 'running')
+  if (finished.length < TREND_MIN_SAMPLES) return 'steady'
+  const split = Math.floor(finished.length / 2)
+  const rate = (tools: readonly { readonly outcome: string }[]): number =>
+    tools.length === 0 ? 0 : tools.filter(tool => tool.outcome === 'error').length / tools.length
+  const before = rate(finished.slice(0, split))
+  const after = rate(finished.slice(split))
+  // A quarter of the window has to change hands before it counts, so one
+  // flaky call in a run of eight does not read as a collapse.
+  if (after > before + 0.25) return 'worsening'
+  if (before > after + 0.25) return 'improving'
+  return 'steady'
+}
+
+function bounded(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min
+  return Math.round(Math.min(max, Math.max(min, value)) * 100) / 100
+}
+
+/** How hard the room is being felt, for the mood it resolved to. Each mood
+ * scales off whatever actually earns it: fury off repetition, worry off the
+ * clock, concern off the streak. Bounded to [0, 1]. */
+export function moodIntensity(
+  mood: Mood,
+  facts: { readonly errorStreak: number; readonly repeatCount: number; readonly activityMinutes: number; readonly tests: 'passing' | 'failing' | undefined },
+): number {
+  switch (mood) {
+    case 'furious':
+      return bounded(Math.max(facts.repeatCount / 8, facts.errorStreak / 10), 0.6, 1)
+    case 'snippy':
+      return bounded((facts.repeatCount - REPEAT_THRESHOLD + 1) / 3, 0.35, 1)
+    case 'concerned':
+      return bounded(Math.max(facts.errorStreak / FURIOUS_STREAK_THRESHOLD, facts.tests === 'failing' ? 0.5 : 0), 0.3, 0.9)
+    case 'worried':
+      return bounded((facts.activityMinutes - MARATHON_MINUTES) / 120 + 0.3, 0.3, 1)
+    case 'proud':
+      return bounded(0.7, 0, 1)
+    case 'bored':
+      return bounded(0.4, 0, 1)
+    case 'delighted':
+      return bounded(0.3, 0, 1)
+  }
+}
+
 /** Read the room. Ordered most-specific first: a repeated failure outranks a
  * fresh one, a fresh failure outranks a success, and worrying about the
  * human outranks being pleased about the code. */
@@ -131,6 +200,8 @@ export function sessionClimate(evidence: ClippyEvidence): SessionClimate {
     : 'delighted'
   return {
     mood,
+    intensity: moodIntensity(mood, { errorStreak, repeatCount, activityMinutes: evidence.activityMinutes, tests }),
+    trend: climateTrend(evidence),
     beat: latestOperationalBeat(evidence),
     errorStreak,
     repeatCount,
@@ -140,11 +211,36 @@ export function sessionClimate(evidence: ClippyEvidence): SessionClimate {
   }
 }
 
+/** The trend, as one clause a line can be hung on — or nothing at all when
+ * the room is holding steady, which is most of the time. */
+export function trendClause(climate: SessionClimate): string | undefined {
+  if (climate.trend === 'steady') return undefined
+  return climate.trend === 'improving'
+    ? 'It has been getting BETTER over the last few steps — say so, in your own way.'
+    : 'It has been getting WORSE over the last few steps — say so, in your own way.'
+}
+
 /** The mood, as an instruction Clippy's own system prompt can act on. His
  * register is no longer a dice roll: it follows what the session is actually
  * doing, so he is pleased when something worked and quietly pointed when the
  * same thing has broken three times. */
 export function moodDirective(climate: SessionClimate): string {
+  return [baseMoodDirective(climate), intensityClause(climate), trendClause(climate)]
+    .filter((part): part is string => part !== undefined)
+    .join(' ')
+}
+
+/** How loudly the mood is being felt, said in a way a line can act on. The
+ * middle of the range says nothing: an ordinary amount of an ordinary mood
+ * needs no extra instruction. */
+function intensityClause(climate: SessionClimate): string | undefined {
+  if (climate.mood === 'delighted' || climate.mood === 'bored') return undefined
+  if (climate.intensity >= 0.85) return 'This feeling is at its strongest — do not soften it.'
+  if (climate.intensity <= 0.4) return 'Only faintly, though: understate it rather than making a scene.'
+  return undefined
+}
+
+function baseMoodDirective(climate: SessionClimate): string {
   switch (climate.mood) {
     case 'proud':
       return 'MOOD: something just went right. Be warm and a little proud of the user, like a paperclip admiring a very tidy letter. Praise the specific thing.'
@@ -195,6 +291,8 @@ export function climateBriefing(climate: SessionClimate): string {
       parts.push('The session is moving along without drama.')
       break
   }
+  if (climate.trend === 'improving') parts.push('It has been getting better over the last few steps.')
+  else if (climate.trend === 'worsening') parts.push('It has been getting worse over the last few steps.')
   if (climate.beat !== undefined) parts.push(`Most recent event: ${climate.beat}.`)
   return parts.join(' ')
 }
@@ -203,6 +301,62 @@ export function climateBriefing(climate: SessionClimate): string {
  * to the session itself only when something actually happened — otherwise
  * they stay quiet instead of narrating an uneventful room. */
 export function isRemarkable(climate: SessionClimate): boolean {
-  return climate.mood === 'proud' || climate.mood === 'concerned'
-    || climate.mood === 'snippy' || climate.mood === 'furious' || climate.mood === 'worried'
+  return climate.mood === 'proud' || isNotableMood(climate.mood)
+}
+
+/** Moods that read as "something is actually going wrong" rather than a
+ * routine or empty register. Shared with the runtime's mood-ring smoothing:
+ * a room that just calmed down from one of these gets one beat of doubt
+ * before the visible mood actually changes (see `ClippyRuntime`), so a
+ * single quiet tool call cannot flicker the color back and forth. */
+export function isNotableMood(mood: Mood): boolean {
+  return mood === 'concerned' || mood === 'snippy' || mood === 'furious' || mood === 'worried'
+}
+
+/** The mood ring: the balloon's border colour, so the climate the extension
+ * computes every beat is finally something you can SEE. The mood system has
+ * always been derived and handed to every generator, but it was invisible
+ * unless you happened to notice the register of a line; this is the same
+ * information, readable at a glance.
+ *
+ * Colours are the Office-era palette, kept muted so the classic yellow
+ * balloon still reads as the classic yellow balloon. */
+export function moodColor(mood: Mood): string {
+  switch (mood) {
+    case 'proud': return '#2e7d32'
+    case 'delighted': return '#1a6fb5'
+    case 'concerned': return '#b8860b'
+    case 'snippy': return '#c05621'
+    case 'furious': return '#a02020'
+    case 'worried': return '#6a4fa3'
+    case 'bored': return '#7a7a7a'
+  }
+}
+
+/** The ring, now that the climate has a volume as well as a name: the same
+ * Office-era colour, plus how heavily to draw it. A session two failures
+ * deep and a session nine failures deep were previously the identical shade
+ * of amber; the border weight is what tells them apart at a glance.
+ *
+ * Returned as plain numbers so the window can render it however it likes
+ * and the server half stays free of CSS. */
+export interface MoodRing {
+  readonly mood: Mood
+  readonly color: string
+  /** Border width in CSS pixels, 2 (the classic balloon) to 4. */
+  readonly width: number
+  /** Halo opacity, 0 (none) to 0.45. Zero for the calm moods, so an
+   * ordinary working session looks exactly as it always has. */
+  readonly glow: number
+}
+
+export function moodRing(mood: Mood, intensity: number): MoodRing {
+  const felt = Number.isFinite(intensity) ? Math.min(1, Math.max(0, intensity)) : 0
+  const notable = isNotableMood(mood)
+  return {
+    mood,
+    color: moodColor(mood),
+    width: notable ? Math.round((2 + felt * 2) * 10) / 10 : 2,
+    glow: notable ? Math.round(felt * 0.45 * 100) / 100 : 0,
+  }
 }

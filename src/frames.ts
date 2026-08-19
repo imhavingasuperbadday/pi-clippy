@@ -132,3 +132,24 @@ export function balloonLines(text: string, maxWidth = 38): string[] {
   const stem = '     │'
   return [top, ...body, bottom, stem]
 }
+
+/** What the footer says he is doing.
+ *
+ * The status bar is pi's, not Clippy's: he gets one short phrase in it and
+ * must not be the loudest thing on the screen. So the line is a paperclip
+ * and a verb, in his register rather than the machine's — "clippy · reading
+ * the file" instead of "clippy: searching" — and `idle` gets nothing at
+ * all, because a paperclip with nothing to do should take up no space.
+ */
+export function statusFor(state: ClippyState): string | undefined {
+  switch (state) {
+    case 'thinking': return '📎 composing'
+    case 'writing': return '📎 taking this down'
+    case 'searching': return '📎 in the filing'
+    case 'alert': return '📎 concerned'
+    case 'celebrate': return '📎 delighted'
+    case 'flourish': return '📎 at leisure'
+    case 'idle':
+    case 'blink': return undefined
+  }
+}

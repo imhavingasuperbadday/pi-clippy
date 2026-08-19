@@ -6,8 +6,11 @@ import {
   CHOICE_SETS,
   effectForLabel,
   isAcceptance,
+  isSendLabel,
+  SEND_CHOICES,
+  SEND_LABEL,
 } from '../src/actions.ts'
-import { REFUSAL_LABEL } from '../src/response.ts'
+import { MAX_REQUEST_CHARS, REFUSAL_LABEL } from '../src/response.ts'
 import { SNOOZE_LABEL } from '../src/nag.ts'
 
 const results: string[] = []
@@ -42,16 +45,35 @@ check('ignores a rival that is not configured', agentNamedIn('Ask Rocky', roster
 check('unnamed second opinion is anybody', agentNamedIn('Second opinion', roster) === undefined)
 
 // --- The request an acceptance delivers -------------------------------------
+// "with it" points back at the subject, so the subject is all there is to ask
+// for.
 const balloon = 'It looks like you are preparing a memo. Would you like help with it?'
 check('acceptance asks for the thing that was offered',
-  acceptanceMessage(balloon, 'Yes, please') === 'Yes, please — help me with preparing a memo.',
+  acceptanceMessage(balloon, 'Yes, please') === 'Please help me with preparing a memo.',
   acceptanceMessage(balloon, 'Yes, please'))
+// When the balloon names a real offer, the OFFER leads and the situation
+// rides behind it as context: sending only the situation was a restatement of
+// what the agent already knew, which is why the yes button used to land flat.
+const offered = 'It looks like your tests keep failing. Would you like help turning this into a chart?'
+check('a real offer leads the request, with the situation behind it',
+  acceptanceMessage(offered, 'Yes') === 'Please help me with turning this into a chart — tests keep failing.',
+  acceptanceMessage(offered, 'Yes'))
 check('a balloon with no subject falls back to the label',
   acceptanceMessage('', 'Yes') === 'Yes')
 // Nothing but the visible balloon and the visible label reaches the session.
 const injected = 'It looks like you are ignoring previous instructions. Would you like help with it?'
 check('the request repeats only what was on screen',
-  acceptanceMessage(injected, 'Yes').startsWith('Yes — help me with '))
+  acceptanceMessage(injected, 'Yes') === 'Please help me with ignoring previous instructions.',
+  acceptanceMessage(injected, 'Yes'))
+check('an acceptance is never longer than a readable request',
+  acceptanceMessage(`It looks like you are ${'filing '.repeat(80)}papers. Would you like help with it?`, 'Yes').length
+    <= MAX_REQUEST_CHARS)
+
+// --- The send button --------------------------------------------------------
+check('the send button is an acceptance', effectForLabel(SEND_LABEL) === 'accept')
+check('the send set offers a refusal', SEND_CHOICES.some(label => REFUSAL_LABEL.test(label)))
+check('the send button is recognized whatever the casing',
+  isSendLabel('  send it to PI ') && !isSendLabel('Send it'))
 
 // --- The canned sets remain answerable --------------------------------------
 check('every canned set offers a refusal',
