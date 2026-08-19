@@ -1,6 +1,6 @@
 {
   "name": "pi-clippy",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Clippy activity avatar for pi: the earnest Microsoft Office Assistant watches your coding session and offers completely misplaced help",
   "type": "module",
   "keywords": [
